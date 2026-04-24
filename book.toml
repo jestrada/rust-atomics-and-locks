@@ -1,0 +1,4 @@
+[book]
+title = "Rust Atomics and Locks"
+authors = ["Mara Bos"]
+description = "Low-Level Concurrency in Practice"
