@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust Atomics and Locks — Chapter 10. Ideas and Inspiration</title>
+<meta name="author" content="Mara Bos">
+<meta name="theme-color" content="#FF69B4">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="site">
+<nav class="index">
+<a href=".">Rust Atomics and Locks</a>
+</nav>
+<article id="inspiration"><h1><a href="">Chapter 10. Ideas and Inspiration</a></h1><p><a class="indexterm" id="index-ideasandinspiration"></a> <a class="indexterm" id="index-inspiration"></a>
+There are an infinite number of concurrency related topics,
+algorithms, data structures, anecdotes, and other potential chapters
+that could be part of this book.
+However, we’ve arrived at the final chapter
+and it’s almost time for us to part ways,
+hopefully leaving you with an excited feeling of new possibilities
+and ready to apply new knowledge and skills in practice.</p><p>This final chapter’s purpose is to provide inspiration
+for your own creations and future work by showing you some ideas that you can study, explore, and build on your own.</p><section id="semaphore"><h2><a href="#semaphore">Semaphore</a></h2><p><a class="indexterm" id="index-semaphores"></a>
+A <em>semaphore</em> is effectively just a counter with two operations:
+<em>signal</em> (also called <em>up</em> or <em>V</em>) and <em>wait</em> (also called <em>down</em> or <em>P</em>).
+The signal operation increments the counter up to a certain maximum,
+while a wait operation decrements the counter.
+<a class="indexterm" id="index-blocking-semaphores"></a>
+If the counter is zero, a wait operation will block and wait
+for a matching signal operation, preventing the counter from ever becoming negative.
+It is a flexible tool that can be used to implement other synchronization primitives.</p><div class="image"><img srcset="images/raal_10in01.png 2x" alt="Visualization of a semaphore. A seemingly infinite strip with integers starting at zero, with the word 'blocked' where negative numbers would be. A large arrow is currently pointing at zero, but can move left and right through the wait and signal operations."></div><p>A semaphore can be implemented as a combination of a <code>Mutex&lt;u32&gt;</code> for the counter and a <code>Condvar</code> for wait operations to wait for.
+However, there are several ways to implement it more efficiently.
+Most notably, on platforms that support futex-like operations (<a href="os-primitives.html#futex">"Futex" in Chapter 8</a>),
+it can be implemented more efficiently as a single <code>AtomicU32</code> (or even <code>AtomicU8</code>).</p><p><a class="indexterm" id="index-binarysemaphore"></a>
+A semaphore with a maximum value of one is sometimes called a <em>binary semaphore</em>,
+and can be used as a building block with which to build other primitives.
+For example, it can be used as a mutex by initializing the counter at one,
+using the wait operation for locking, and the signal operation for unlocking.
+By initializing it at zero, it can also be used for signaling, like a condition variable.
+For example, the standard <code>park()</code> and <code>unpark()</code> functions in <code>std::<wbr>thread</code>
+can be implemented as wait and signal operations on a binary semaphore associated with the thread.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>Note how a mutex can be implemented using a semaphore,
+while a semaphore can be implemented using a mutex (and a condition variable).
+It’s advisable to avoid using a mutex-based semaphore to implement a semaphore-based mutex,
+and the other way around.</p></div></div><p>Further reading:</p><ul><li><p><a href="https://oreil.ly/_rSRZ">Wikipedia article on semaphores</a></p></li><li><p><a href="https://oreil.ly/ZVaei">Stanford University course notes on semaphores</a></p></li></ul></section><section id="rcu"><h2><a href="#rcu">RCU</a></h2><p><a class="indexterm" id="index-RCUreadcopyupdate"></a>
+If you want to allow multiple threads to (mostly) read and (sometimes) mutate some data, you can use an <code>RwLock</code>.
+When this data is just a single integer,
+you can use an atomic variable (such as <code>AtomicU32</code>) to avoid locking, which is more efficient.
+However, for larger chunks of data, like a struct with many fields,
+there’s no available atomic type that allows for lock-free atomic operations on the entire object.</p><p>Just like every other problem in computer science,
+this problem can be solved by adding a layer of indirection.
+Instead of the struct itself, you can use an atomic variable to store a pointer to it.
+This still doesn’t allow you to modify the struct as a whole atomically,
+but it does allow you to replace the entire struct atomically, which is nearly as good.</p><p>This pattern is often called <em>RCU</em>, which stands for "read, copy, update,"
+the steps necessary to replace the data.
+After reading the pointer, the struct can be copied into a new allocation
+that can be modified without worrying about other threads.
+When ready, the atomic pointer can be updated using a compare-and-exchange operation (<a href="atomics.html#cas">"Compare-and-Exchange Operations" in Chapter 2</a>),
+which will only succeed if no other thread has replaced the data in the meantime.</p><div class="image"><img srcset="images/raal_10in02.png 2x" alt="Visualization of the RCU pattern showing five steps. Step 1, read, shows an arrow from an atomic pointer to a struct it points at. Step 2, copy, copies the entire struct into a new allocation. Step 3, modify, modifies a single field of the copy. Step 4, update, is a compare-exchange operation to update the atomic pointer to point at the newly allocated copy. Step 5, deallocate, deallocates the original struct, but this step is grayed out and has a question mark."></div><p>The most interesting part about the RCU pattern is the last step,
+which does not have a letter in the acronym: deallocating the old data.
+After a successful update, other threads might still be reading the old copy,
+if they read the pointer before the update.
+You’ll have to wait for all those threads to be done before the old copy can be deallocated.</p><p>There are many possible solutions for this issue,
+including reference counting (like <code>Arc</code>), leaking memory (ignoring the problem),
+garbage collection,
+hazard pointers (a way for threads to tell the others what pointers they are currently using), and
+quiescent state tracking (waiting for each thread to reach a point at which it is definitely not using any pointers).
+The last one can be extremely efficient in certain conditions.</p><p><a class="indexterm" id="index-Linux-RCU"></a>
+Many data structures in the Linux kernel are RCU based,
+and there are many interesting talks and articles about their implementation details
+that can provide a great deal of inspiration.</p><p>Further reading:</p><ul><li><p><a href="https://oreil.ly/egIIi">Wikipedia article on the read-copy-update pattern</a></p></li><li><p><a href="https://oreil.ly/GQZ6r">LWN article "What is RCU, Fundamentally?"</a></p></li></ul></section><section id="lock-free-linked-list"><h2><a href="#lock-free-linked-list">Lock-Free Linked List</a></h2><p><a class="indexterm" id="index-RCUreadcopyupdate-2"></a> <a class="indexterm" id="index-linkedlist"></a>
+Expanding on the basic RCU pattern,
+you can add an atomic pointer to the struct to point to the next one,
+to turn it into a <em>linked list</em>.
+This allows for threads to atomically add or remove elements on this list,
+without having to copy the entire list for <span>every update</span>.</p><p>To insert a new element at the start of the list,
+you only have to allocate that element and point its
+pointer at the first element in the list,
+and then atomically update the initial pointer
+to point to your newly allocated element.</p><div class="image"><img srcset="images/raal_10in03.png 2x" alt="Visualization of a singly linked list with three nodes, that is getting a fourth node inserted at the head in three steps. Step 1, read, shows an arrow from an atomic pointer to the first node. Step 2, create, is the allocation and creation of a new node that points at the first node from step 1. Step 3, update, is a compare-exchange operation to update the first atomic pointer to point at the newly created node."></div><p>Similarly, removing an element can be done by atomically updating the pointer
+before it to point to the element after it.
+However, when multiple writers are involved,
+care must be taken to handle concurrent insertion or removal operations on neighboring elements.
+Otherwise, you might accidentally also remove a concurrently newly inserted element,
+or undo the removal of a concurrently removed element.</p><div class="note" role="note" aria-label="tip"><div class="icon" aria-hidden="true"><i class="tip"></i></div><div class="text"><p>To keep things simple, you can use a regular mutex to avoid concurrent mutations.
+That way, reading is still a lock-free operation, but you don’t have to worry about handling concurrent mutation.</p></div></div><p>After detaching an element from the linked list, you’ll run into the same issue as before:
+waiting until you can deallocate it (or otherwise claim ownership).
+The same solutions we discussed for the basic RCU pattern can work in this case as well.</p><p>In general, you can build a wide variety of elaborate lock-free data structures based on
+compare-and-exchange operations on atomic pointers, but you’ll always need a
+good strategy for deallocating or otherwise reclaiming ownership of the allocations.</p><p>Further reading:</p><ul><li><p><a href="https://oreil.ly/kVQ1O">Wikipedia article on non-blocking linked lists</a></p></li><li><p><a href="https://oreil.ly/H0lt4">LWN article "Using RCU for Linked Lists—A Case Study"</a></p></li></ul></section><section id="queue-based-locks"><h2><a href="#queue-based-locks">Queue-Based Locks</a></h2><p><a class="indexterm" id="index-queue-basedlocks"></a>
+For most standard locking primitives, the operating system’s kernel
+keeps track of the threads that are blocked on it,
+and is responsible for picking one to wake up when asked to do so.
+An interesting alternative is to implement a mutex (or other locking primitive),
+by manually keeping track of the queue of waiting threads.</p><p>Such a mutex could be implemented as a single <code>AtomicPtr</code>
+that can point to a (list of) waiting threads.</p><p>Each element in this list needs to contain something that can be used to wake up
+the corresponding thread, such as a <code>std::<wbr>thread::<wbr>Thread</code> object.
+Some unused bits of the atomic pointer can be used to store the state of the mutex itself,
+and whatever is necessary for managing the state of the queue.</p><div class="image"><img srcset="images/raal_10in04.png 2x" alt="Visualization of a queue based lock. The lock is an atomic pointer, of which the last two bits are labeled 'mutex locked' and 'queue locked'. The rest of the pointer points at the queue, a singly linked list of three nodes, in which each node contains a Thread object."></div><p>There are many variations possible.
+The queue could be protected by its own lock bit or it could be implemented as a (partially) lock-free structure.
+The elements don’t have to be allocated on the heap,
+but could be local variables of the threads that are waiting.
+The queue could be a doubly-linked list with not only pointers to the next element,
+but also to the previous element.
+The first element could also include a pointer to the last element to allow efficiently appending an element at the end.</p><p>This pattern allows for implementing efficient locking primitives
+using only something that can be used to block and wake up a single thread, such as thread parking.</p><p><a class="indexterm" id="index-slimreader-writerlocksWindows-2"></a> <a class="indexterm" id="index-Windows-SRWlocks-2"></a> <a class="indexterm" id="index-SRWlocksWindows-2"></a>
+Windows SRW locks (<a href="os-primitives.html#windows-srw">"Slim reader-writer locks" in Chapter 8</a>) are implemented using this pattern.</p><p>Further reading:</p><ul><li><p><a href="https://oreil.ly/El8GA">Notes on the implementation of Windows SRW locks</a></p></li><li><p><a href="https://oreil.ly/aFyg1">A Rust implementation of queue-based locks</a></p></li></ul></section><section id="parking-lotbased-locks"><h2><a href="#parking-lotbased-locks">Parking Lot–Based Locks</a></h2><p><a class="indexterm" id="index-parkinglot-basedlocks"></a>
+To make a highly efficient mutex that’s as small as possible,
+you can build upon the queue-based locks idea by moving the queue into a global data structure,
+leaving only one or two bits inside the mutex itself.
+This way, the mutex only needs to be a single byte.
+You could even put it in some unused bits of a pointer,
+allowing for very fine-grained locking at almost no extra cost.</p><p>The global data structure can be a <code>HashMap</code> that maps memory addresses to a queue of threads waiting on the
+mutex at that address.
+This global data structure is often called a <em>parking lot</em>, since it’s a collection of parked threads.</p><div class="image"><img srcset="images/raal_10in05.png 2x" alt="Visualization of a mutex and parking lot. The mutex is an AtomicU8 of which the last two bits are labeled 'locked' and 'has queue'. The rest is zero. The parking lot consists of a HashMap that maps the address of the mutex to a queue of Thread objects."></div><p>The pattern can be generalized by not only tracking queues for mutexes,
+but also for condition variables and other primitives.
+By tracking a queue for any atomic variable, this effectively provides a way
+to implement futex-like functionality on platforms that don’t natively support that.</p><p><a class="indexterm" id="index-parkinglotcrate"></a>
+This pattern is most well known from its 2015 implementation in WebKit,
+where it was used for locking JavaScript objects.
+Its implementation inspired other implementations, such as the popular <code>parking_<wbr>lot</code> Rust crate.</p><p>Further reading:</p><ul><li><p><a href="https://oreil.ly/6dPim">WebKit blog post, "Locking in WebKit"</a></p></li><li><p><a href="https://oreil.ly/UPcXu">Documentation of the <code>parking_<wbr>lot</code> crate</a></p></li></ul></section><section id="sequence-lock"><h2><a href="#sequence-lock">Sequence Lock</a></h2><p><a class="indexterm" id="index-sequencelocks"></a>
+A sequence lock is another solution to the problem of atomically updating (larger) data
+without using traditional (blocking) locks.
+It uses an atomic counter that is odd while the data is being updated,
+and even when the data is ready to be read.</p><p>The writing thread will have to increment the counter from even to odd
+before mutating the data,
+after which it has to increment the counter again to leave it at a (different) even value.</p><p>Any reading thread can, at any point and without blocking,
+read the data by reading the counter both before and after.
+If the two values from the counter are equal and even,
+there was no concurrent mutation, meaning you read a valid copy of the data.
+Otherwise, you might have read data that was concurrently being modified,
+in which case you should just try again.</p><div class="image"><img srcset="images/raal_10in06.png 2x" alt="Visualization of a sequence lock, an AtomicUsize followed by a larger chunk of data. A writer has three steps: increment counter, write data, increment counter again. Readers have four steps: read counter, read data, read counter, and retry if unequal or odd."></div><p>This is a great pattern for making data available to other threads, without the possibility of the reading threads blocking the writing thread.
+It is often used in operating systems kernels and many embedded systems.
+Since the readers need only read access to the memory and no pointers are involved,
+this can be a great data structure to safely use in shared memory, between processes,
+without needing to trust the readers.
+For example, the Linux kernel uses this pattern to very efficiently provide timestamps to processes by providing them with read-only access to (shared) memory.</p><p>An interesting question is how this fits into the memory model.
+Concurrent non-atomic reads and writes to the same data result in undefined behavior,
+even if the read data is ignored.
+This means that, technically speaking, both reading and writing the data should
+be done using only atomic operations, even though the entire read or write does
+not have to be a single atomic operation.</p><p>Further reading:</p><ul><li><p><a href="https://oreil.ly/T28bW">Wikipedia article on Linux’s Seqlock</a></p></li><li><p><a href="https://oreil.ly/Qavc7">Rust RFC 3301, <code>AtomicPerByte</code></a></p></li><li><p><a href="https://oreil.ly/yHd_7">Documentation of the <code>seqlock</code> crate</a></p></li></ul></section><section id="teaching-materials"><h2><a href="#teaching-materials">Teaching Materials</a></h2><p><a class="indexterm" id="index-teaching"></a>
+It can be great fun to spend many hours—​or years—​inventing new concurrent data
+structures and designing ergonomic Rust implementations of them.
+If you’re looking for something else to do with your knowledge on Rust,
+atomics, locks, concurrent data structures, and concurrency in general,
+it can also be very fulfilling to create new teaching materials to share your knowledge with others.</p><p>There is a great lack of accessible resources aimed at those new to these topics.
+Rust has played a significant role in making systems programming more accessible to everyone,
+but many programmers still shy away from low-level concurrency.
+Atomics are often thought of as a somewhat mystical topic that’s best left to a very small group of experts,
+which is a shame.</p><p>I hope this very book makes a significant difference,
+but there is so much space for more books, blog posts, articles, video courses,
+conference talks, and other materials about Rust concurrency.
+  <a class="indexterm" id="index-luckgood"></a> <a class="indexterm" id="index-goodluck"></a></p><p style="margin-top: 2em; margin-bottom: 2em; font-size: 200%; text-align: center;">~</p><p>I'm excited to see what you create.</p><p style="margin-top: 2em; break-before: avoid;">Good luck. ♥</p></section></article></div>
+<footer>
+<p><a href=".">Rust Atomics and Locks</a><br>&copy; 2023 ♥ Mara Bos</p>
+<p><a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/"><img alt="Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License" src="https://i.creativecommons.org/l/by-nc-nd/4.0/88x31.png"></a></p>
+<p class="report-issue"><a href="https://github.com/m-ou-se/rust-atomics-and-locks/issues/">Report an issue</a></p>
+</footer>
+</body>
+</html>

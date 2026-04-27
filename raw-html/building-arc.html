@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust Atomics and Locks — Chapter 6. Building Our Own "Arc"</title>
+<meta name="author" content="Mara Bos">
+<meta name="theme-color" content="#FF69B4">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="site">
+<nav class="index">
+<a href=".">Rust Atomics and Locks</a>
+</nav>
+<article id="building-arc"><h1><a href="">Chapter 6. Building Our Own "Arc"</a></h1><p><a class="indexterm" id="index-buildingourown-Arc"></a> <a class="indexterm" id="index-Arc-buildingourown"></a>
+In <a href="basics.html#arc">"Reference Counting" in Chapter 1</a>, we saw the <code>std::<wbr>sync::<wbr>Arc&lt;T&gt;</code>
+type that allows for shared ownership through reference counting.
+The <code>Arc::<wbr>new</code> function creates a new allocation, just like <code>Box::<wbr>new</code>.
+However, unlike a <code>Box</code>, a cloned <code>Arc</code> will share the original
+allocation, without creating a new one.
+The shared allocation will only be dropped once the <code>Arc</code> and all its clones are dropped.</p><p>The memory ordering considerations involved in an implementation of this type
+can get quite interesting.
+In this chapter, we’ll put more of the theory to practice by implementing our own <code>Arc&lt;T&gt;</code>.
+We’ll start with a basic version,
+then extend it to support <em>weak pointers</em> for cyclic structures,
+and finish the chapter with an optimized version
+that’s nearly identical to the implementation in the standard library.</p><section id="basic-reference-counting"><h2><a href="#basic-reference-counting">Basic Reference Counting</a></h2><p>Our first version will use a single <code>AtomicUsize</code> to count
+the number of <code>Arc</code> objects that share an allocation.
+Let’s start with a struct that holds this counter and the <span><code>T</code> object</span>:</p><pre>struct ArcData&lt;T&gt; {
+    ref_count: AtomicUsize,
+    data: T,
+}</pre><p>Note that this struct is not public.
+It’s an internal implementation detail of our <code>Arc</code> implementation.</p><p>Next is the <code>Arc&lt;T&gt;</code> struct itself,
+which is effectively just a pointer to a (shared) <code>ArcData&lt;T&gt;</code> object.</p><p>It might be tempting to make it a wrapper for a <code>Box&lt;ArcData&lt;T&gt;&gt;</code>,
+using a standard <code>Box</code> to handle the allocation of the <code>ArcData&lt;T&gt;</code>.
+However, a <code>Box</code> represents exclusive ownership, not shared ownership.
+We can’t use a reference either, because we’re not just borrowing the data owned by something else,
+and its lifetime ("until the last clone of this <code>Arc</code> is dropped") is not directly representable with a Rust lifetime.</p><p>Instead, we’ll have to resort to using a pointer and handle allocation and
+the concept of ownership manually.
+<a class="indexterm" id="index-pointers-NonNull"></a> <a class="indexterm" id="index-NonNull"></a>
+Instead of a <code>*mut T</code> or <code>*const T</code>, we’ll use a <code>std::<wbr>ptr::<wbr>NonNull&lt;T&gt;</code>,
+which represents a pointer to <code>T</code> that is never null.
+That way, an <code>Option&lt;Arc&lt;T&gt;&gt;</code> will be the same size as an <code>Arc&lt;T&gt;</code>,
+using the null pointer representation for <code>None</code>.</p><pre>use std::ptr::NonNull;
+
+pub struct Arc&lt;T&gt; {
+    ptr: NonNull&lt;ArcData&lt;T&gt;&gt;,
+}</pre><p>With a reference or a <code>Box</code>, the compiler automatically understands
+for which <code>T</code> it should make your struct <code>Send</code> or <code>Sync</code>.
+When using a raw pointer or <code>NonNull</code>, however, it’ll conservatively assume it’s never <code>Send</code> or <code>Sync</code>
+unless we explicitly tell it otherwise.
+<a class="indexterm" id="index-Sendtrait-implementingforArc"></a> <a class="indexterm" id="index-Synctrait-implementingforArc"></a></p><p>Sending an <code>Arc&lt;T&gt;</code> across threads results in a <code>T</code> object being shared, requiring <code>T</code> to be <code>Sync</code>.
+Similarly, sending an <code>Arc&lt;T&gt;</code> across threads could result in another thread
+dropping that <code>T</code>, effectively transferring it to the other thread, requiring <code>T</code> to be <code>Send</code>.
+In other words, <code>Arc&lt;T&gt;</code> should be <code>Send</code> if and only if <code>T</code> is both <code>Send</code> and <code>Sync</code>.
+The exact same holds for <code>Sync</code>, since a shared <code>&amp;Arc&lt;T&gt;</code> can be cloned into a new <code>Arc&lt;T&gt;</code>.</p><pre>unsafe impl&lt;T: Send + Sync&gt; Send for Arc&lt;T&gt; {}
+unsafe impl&lt;T: Send + Sync&gt; Sync for Arc&lt;T&gt; {}</pre><p>For <code>Arc&lt;T&gt;::<wbr>new</code>, we’ll have to create a new allocation with an <code>ArcData&lt;T&gt;</code>
+with a reference count of one.
+<a class="indexterm" id="index-Box-leak-2"></a>
+We’ll use <code>Box::<wbr>new</code> to create a new allocation,
+<code>Box::<wbr>leak</code> to give up our exclusive ownership of this allocation,
+and <code>NonNull::<wbr>from</code> to turn it into a pointer:</p><pre>impl&lt;T&gt; Arc&lt;T&gt; {
+    pub fn new(data: T) -&gt; Arc&lt;T&gt; {
+        Arc {
+            ptr: NonNull::from(Box::leak(Box::new(ArcData {
+                ref_count: AtomicUsize::new(1),
+                data,
+            }))),
+        }
+    }
+
+    …
+}</pre><p>We know the pointer will always point to a valid <code>ArcData&lt;T&gt;</code>
+as long as the <code>Arc</code> object exists.
+However, this is not something the compiler knows or checks for us,
+so accessing the <code>ArcData</code> through the pointer
+requires unsafe code.
+We’ll add a private helper function
+to get from the <code>Arc</code> to the <code>ArcData</code>,
+since this is something we’ll have to do several times:</p><pre>    fn data(&amp;self) -&gt; &amp;ArcData&lt;T&gt; {
+        unsafe { self.ptr.as_ref() }
+    }</pre><p>Using that, we can now implement the <code>Deref</code> trait
+to make our <code>Arc&lt;T&gt;</code> transparently behave like a reference to a <code>T</code>:
+<a class="indexterm" id="index-Dereftrait-3"></a></p><pre>impl&lt;T&gt; Deref for Arc&lt;T&gt; {
+    type Target = T;
+
+    fn deref(&amp;self) -&gt; &amp;T {
+        &amp;self.data().data
+    }
+}</pre><p>Note that we don’t implement <code>DerefMut</code>.
+Since an <code>Arc&lt;T&gt;</code> represents shared ownership,
+we can’t unconditionally provide a <code>&amp;mut T</code>.</p><p><a class="indexterm" id="index-Clonetrait-4"></a>
+Next: the <code>Clone</code> implementation.
+The cloned <code>Arc</code> will use the same pointer,
+after incrementing the reference counter:</p><pre>impl&lt;T&gt; Clone for Arc&lt;T&gt; {
+    fn clone(&amp;self) -&gt; Self {
+        // TODO: Handle overflows.
+        self.data().ref_count.fetch_add(1, Relaxed);
+        Arc {
+            ptr: self.ptr,
+        }
+    }
+}</pre><p>We can use <code>Relaxed</code> memory ordering to increment the reference counter,
+since there are no operations on other variables
+that need to strictly happen before or after this atomic operation.
+<a class="indexterm" id="index-relaxedmemoryordering-referencecounting"></a> <a class="indexterm" id="index-memoryordering-referencecounting"></a>
+We already had access to the contained <code>T</code> before this operation
+(through the original <code>Arc</code>), and that remains unchanged afterwards
+(but now through at least two <code>Arc</code> objects).</p><p><a class="indexterm" id="index-overflowsatomic-referencecounter"></a>
+An <code>Arc</code> would need to be cloned many times before
+the counter has any chance of overflowing,
+but running <code>std::<wbr>mem::<wbr>forget(arc.clone())</code> in a loop
+can make it happen.
+We can use any of the techniques discussed in
+<a href="atomics.html#example-id-allocation">"Example: ID Allocation" in Chapter 2</a> and
+<a href="atomics.html#example-handle-overflow">"Example: ID Allocation Without Overflow" in Chapter 2</a> to handle <span>this issue</span>.</p><p>To keep things as efficient as possible in the normal (non-overflowing) case,
+we’ll keep the original <code>fetch_<wbr>add</code> and simply abort the whole process
+if we get uncomfortably close to overflowing:</p><pre>        if self.data().ref_count.fetch_add(1, Relaxed) &gt; usize::MAX / 2 {
+            std::process::abort();
+        }</pre><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>Aborting the process is not instant,
+leaving for some time during which another thread can also call <code>Arc::<wbr>clone</code>,
+incrementing the reference counter further.
+Therefore, just checking for <code>usize::<wbr>MAX - 1</code> would not suffice.
+However, using <code>usize::<wbr>MAX / 2</code> as the limit works fine:
+assuming every thread takes at least a few bytes of space in memory,
+it’s impossible for <code>usize::<wbr>MAX / 2</code> threads to exist concurrently.</p></div></div><p>Just like we increment the counter when cloning,
+we need to decrement it when dropping an <code>Arc</code>.
+The thread that sees the counter go from one to zero
+knows it dropped the last <code>Arc&lt;T&gt;</code>, and is responsible for
+dropping and deallocating the <code>ArcData&lt;T&gt;</code>.</p><p><a class="indexterm" id="index-Box-fromraw-2"></a> <a class="indexterm" id="index-Droptrait-7"></a>
+We’ll use <code>Box::<wbr>from_<wbr>raw</code> to reclaim exclusive ownership of the allocation,
+and then drop it right away using <code>drop()</code>:</p><pre>impl&lt;T&gt; Drop for Arc&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        // TODO: Memory ordering.
+        if self.data().ref_count.fetch_sub(1, …) == 1 {
+            unsafe {
+                drop(Box::from_raw(self.ptr.as_ptr()));
+            }
+        }
+    }
+}</pre><p><a class="indexterm" id="index-Arc-memoryordering"></a> <a class="indexterm" id="index-happens-beforerelationships-inArc"></a>
+For this operation, we can’t use <code>Relaxed</code> ordering,
+since we need to make sure that nothing is still accessing the data when we drop it.
+In other words, every single drop of one of the former <code>Arc</code> clones must have happened
+before the final drop.
+So, the final <code>fetch_<wbr>sub</code> must establish a happens-before relationship with
+every previous <code>fetch_<wbr>sub</code> operation, which we can do using release and acquire ordering:
+decrementing it from, for example, two to one effectively "releases" the data,
+while decrementing it from one to zero "acquires" ownership of it.</p><p><a class="indexterm" id="index-memoryordering-referencecounting-2"></a> <a class="indexterm" id="index-releaseandacquirememoryordering-referencecounting"></a>
+We could use <code>AcqRel</code> memory ordering to cover both cases,
+but only the final decrement to zero needs <code>Acquire</code>,
+while the others only need <code>Release</code>.
+For efficiency, we’ll use only <code>Release</code> for the <code>fetch_<wbr>sub</code> operation
+and a separate <code>Acquire</code> fence only when necessary:
+<a class="indexterm" id="index-fences-2"></a> <a class="indexterm" id="index-memoryordering-fences-2"></a> <a class="indexterm" id="index-releaseandacquirememoryordering-acquirefence-3"></a></p><pre>        if self.data().ref_count.fetch_sub(1, Release) == 1 {
+            fence(Acquire);
+            unsafe {
+                drop(Box::from_raw(self.ptr.as_ptr()));
+            }
+        }</pre><section id="testing-it"><h3><a href="#testing-it">Testing It</a></h3><p><a class="indexterm" id="index-Droptrait-8"></a>
+To test that our <code>Arc</code> is behaving as intended,
+we can write a unit test that creates an <code>Arc</code>
+containing a special object that lets us know when it gets dropped:</p><pre>#[test]
+fn test() {
+    static NUM_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    struct DetectDrop;
+
+    impl Drop for DetectDrop {
+        fn drop(&amp;mut self) {
+            NUM_DROPS.fetch_add(1, Relaxed);
+        }
+    }
+
+    // Create two Arcs sharing an object containing a string
+    // and a DetectDrop, to detect when it's dropped.
+    let x = Arc::new(("hello", DetectDrop));
+    let y = x.clone();
+
+    // Send x to another thread, and use it there.
+    let t = std::thread::spawn(move || {
+        assert_eq!(x.0, "hello");
+    });
+
+    // In parallel, y should still be usable here.
+    assert_eq!(y.0, "hello");
+
+    // Wait for the thread to finish.
+    t.join().unwrap();
+
+    // One Arc, x, should be dropped by now.
+    // We still have y, so the object shouldn't have been dropped yet.
+    assert_eq!(NUM_DROPS.load(Relaxed), 0);
+
+    // Drop the remaining `Arc`.
+    drop(y);
+
+    // Now that `y` is dropped too,
+    // the object should've been dropped.
+    assert_eq!(NUM_DROPS.load(Relaxed), 1);
+}</pre><p>This compiles and runs fine,
+so it seems our <code>Arc</code> is behaving as intended!
+While this is encouraging, it doesn’t prove that the implementation is fully correct.
+It’s advisable to use a long stress test involving many threads to gain more confidence.</p><aside id="miri"><h4><a href="#miri">Miri</a></h4><p><a class="indexterm" id="index-Miri"></a> <a class="indexterm" id="index-undefinedbehavior-Miridetectingwith"></a>
+It can also be very useful to run tests using Miri.
+Miri is an experimental but very useful and powerful tool to check unsafe code
+for various forms of undefined behavior.</p><p>Miri is an interpreter for the Rust compiler’s mid-level intermediate representation.
+This means that it runs your code not by compiling it to native processor instructions,
+but instead by interpreting it at a point when information like types and lifetimes are
+still available.
+Because of this, Miri runs programs significantly slower than when they are compiled and run normally,
+but is able to detect many mistakes that would result in undefined behavior.</p><p><a class="indexterm" id="index-memoryordering-Miridetectingproblemswith"></a>
+It includes experimental support for detecting data races, which allows it to detect memory ordering problems.</p><p>For more details and a guide on how to use Miri, see <a href="https://oreil.ly/4V0Ra">its GitHub page</a>.</p></aside></section><section id="mutation"><h3><a href="#mutation">Mutation</a></h3><p><a class="indexterm" id="index-DerefMuttrait-4"></a>
+As mentioned before, we can’t implement <code>DerefMut</code> for our <code>Arc</code>.
+We can’t unconditionally promise exclusive access (<code>&amp;mut T</code>) to the data,
+because it might be accessed through other <code>Arc</code> objects.</p><p>However, what we can do is to allow it conditionally.
+We can make a method that only gives out a <code>&amp;mut T</code> if the reference counter is one,
+proving that there’s no other <code>Arc</code> object that could be used to access the same data.</p><p><a class="indexterm" id="index-Arc-getmut"></a>
+This function, which we’ll call <code>get_<wbr>mut</code>,
+will have to take a <code>&amp;mut Self</code> to make sure
+nothing else can use this same <code>Arc</code> to access the <code>T</code>.
+Knowing that there’s only one <code>Arc</code> would be meaningless
+if that one <code>Arc</code> can still be shared.</p><p><a class="indexterm" id="index-happens-beforerelationships-inArc-2"></a> <a class="indexterm" id="index-releaseandacquirememoryordering-referencecounting-2"></a> <a class="indexterm" id="index-memoryordering-referencecounting-3"></a> <a class="indexterm" id="index-Arc-memoryordering-2"></a>
+We’ll need to use acquire memory ordering
+to make sure that threads that previously owned a clone of the <code>Arc</code>
+are no longer accessing the data.
+We need to establish a happens-before relationship with
+every single <code>drop</code> that led to the reference counter being one.</p><p>This only matters when the reference counter is actually one;
+if it’s higher, we’ll not provide a <code>&amp;mut T</code>, and the memory ordering is irrelevant.
+So, we can use a relaxed load, followed by a conditional acquire fence, as follows:
+<a class="indexterm" id="index-releaseandacquirememoryordering-acquirefence-4"></a></p><pre>    pub fn get_mut(arc: &amp;mut Self) -&gt; Option&lt;&amp;mut T&gt; {
+        if arc.data().ref_count.load(Relaxed) == 1 {
+            fence(Acquire);
+            // Safety: Nothing else can access the data, since
+            // there's only one Arc, to which we have exclusive access.
+            unsafe { Some(&amp;mut arc.ptr.as_mut().data) }
+        } else {
+            None
+        }
+    }</pre><p>This function does not take a <code>self</code> argument,
+but takes a regular argument (named <code>arc</code>) instead.
+This means it can only be called as <code>Arc::<wbr>get_<wbr>mut(&amp;mut a)</code>,
+and not as <code>a.get_<wbr>mut()</code>.
+This is advisable for types that implement <code>Deref</code>,
+to avoid ambiguity with a similarly named method on the underlying <code>T</code>.</p><p>The returned mutable reference implicitly borrows the lifetime from the argument,
+meaning that nothing can use the original <code>Arc</code> as long as the returned <code>&amp;mut T</code>
+is still around, allowing for safe mutation.</p><p>When the lifetime of the <code>&amp;mut T</code> expires,
+the <code>Arc</code> can be used and shared with other threads again.
+One might wonder whether we need to worry about memory ordering
+for threads accessing the data afterwards.
+However, that’s the responsibility of whatever mechanism is used for sharing
+the <code>Arc</code> (or a new clone of it) with another thread.
+(For example, a mutex, a channel, or spawning a new thread.)</p></section></section><section id="weak-pointers"><h2><a href="#weak-pointers">Weak Pointers</a></h2><p>Reference counting can be very useful when representing
+structures in memory consisting of multiple objects.
+For example, every node in a tree structure could contain
+an <code>Arc</code> to each of its child nodes.
+That way, when a node is dropped, its child nodes
+that are no longer in use are all (recursively) dropped as well.</p><p><a class="indexterm" id="index-cyclicstructuresArc"></a> <a class="indexterm" id="index-Arc-cyclicstructures"></a>
+This breaks down for <em>cyclic structures</em>, however.
+If a child node also contains an <code>Arc</code> to its parent node,
+neither will be dropped since there’s always at least one <code>Arc</code> that still refers to it.</p><p> <a class="indexterm" id="index-Arc-weakpointers"></a>
+The standard library’s <code>Arc</code> comes with a solution for that problem: <code>Weak&lt;T&gt;</code>.
+A <code>Weak&lt;T&gt;</code>, also called a <em>weak pointer</em>, behaves a bit like an <code>Arc&lt;T&gt;</code>,
+but does not prevent an object from getting dropped.
+A <code>T</code> can be shared between several <code>Arc&lt;T&gt;</code> and <code>Weak&lt;T&gt;</code> objects,
+but when all <code>Arc&lt;T&gt;</code> objects are gone, the <code>T</code> is dropped,
+regardless of whether there are any <code>Weak&lt;T&gt;</code> objects left.</p><p>This means that a <code>Weak&lt;T&gt;</code> can exist without a <code>T</code>,
+and thus cannot provide a <code>&amp;T</code> unconditionally, like an <code>Arc&lt;T&gt;</code> can.
+However, to access the <code>T</code> given a <code>Weak&lt;T&gt;</code>, it can be <em>upgraded</em> to an <code>Arc&lt;T&gt;</code> through its <code>upgrade()</code> method.
+This method returns an <code>Option&lt;Arc&lt;T&gt;&gt;</code>, returning <code>None</code> if the <code>T</code> has already been dropped.</p><p>In an <code>Arc</code>-based structure, <code>Weak</code> can be used to break cycles.
+For example, child nodes in a tree structure could use <code>Weak</code> rather than <code>Arc</code> for their parent node.
+Then, dropping of a parent node is not prevented through the existence of its child nodes.</p><p>Let’s implement this.</p><p>Just like before, when the number of <code>Arc</code> objects reaches zero, we can drop the contained <code>T</code> object.
+However, we can’t drop and deallocate the <code>ArcData</code> yet, since there might still be weak pointers referencing it.
+Only once the last <code>Weak</code> pointer is also gone can we drop and deallocate the <code>ArcData</code>.</p><p>So, we’ll use two counters: one for "the number of things that reference the <code>T</code>,"
+and another for "the number of things that reference the <code>ArcData&lt;T&gt;</code>." In other words, the first counter is the same as before: it counts <code>Arc</code> objects,
+while the second counter counts both <code>Arc</code> and <code>Weak</code> objects.</p><p>We also need something that allows us to drop the contained object (<code>T</code>)
+while the <code>ArcData&lt;T&gt;</code> is still in use by the weak pointers.
+<a class="indexterm" id="index-interiormutability-3"></a> <a class="indexterm" id="index-UnsafeCell-3"></a>
+We’ll use an <code>Option&lt;T&gt;</code> so we can use <code>None</code> for when the data is dropped,
+and wrap that in an <code>UnsafeCell</code> for <em>interior mutability</em> (<a href="basics.html#interior-mutability">"Interior Mutability" in Chapter 1</a>),
+to allow that to happen when the <code>ArcData&lt;T&gt;</code> isn’t exclusively owned:</p><pre>struct ArcData&lt;T&gt; {
+    /// Number of `Arc`s.
+    data_ref_count: AtomicUsize,
+    /// Number of `Arc`s and `Weak`s combined.
+    alloc_ref_count: AtomicUsize,
+    /// The data. `None` if there's only weak pointers left.
+    data: UnsafeCell&lt;Option&lt;T&gt;&gt;,
+}</pre><p>If we think of a <code>Weak&lt;T&gt;</code> as an object responsible for keeping an <code>ArcData&lt;T&gt;</code> alive,
+it can make sense to implement <code>Arc&lt;T&gt;</code> as a struct containing a <code>Weak&lt;T&gt;</code>,
+since an <code>Arc&lt;T&gt;</code> needs to do the same, and more.</p><pre>pub struct Arc&lt;T&gt; {
+    weak: Weak&lt;T&gt;,
+}
+
+pub struct Weak&lt;T&gt; {
+    ptr: NonNull&lt;ArcData&lt;T&gt;&gt;,
+}
+
+unsafe impl&lt;T: Sync + Send&gt; Send for Weak&lt;T&gt; {}
+unsafe impl&lt;T: Sync + Send&gt; Sync for Weak&lt;T&gt; {}</pre><p>The <code>new</code> function is mostly the same as before, except it now
+has two counters to initialize at once:</p><pre>impl&lt;T&gt; Arc&lt;T&gt; {
+    pub fn new(data: T) -&gt; Arc&lt;T&gt; {
+        Arc {
+            weak: Weak {
+                ptr: NonNull::from(Box::leak(Box::new(ArcData {
+                    alloc_ref_count: AtomicUsize::new(1),
+                    data_ref_count: AtomicUsize::new(1),
+                    data: UnsafeCell::new(Some(data)),
+                }))),
+            },
+        }
+    }
+
+    …
+}</pre><p>Just like before, we assume that the <code>ptr</code> field
+always points at a valid <code>ArcData&lt;T&gt;</code>.
+This time, we’ll encode that assumption
+as a private <code>data()</code> helper method on <code>Weak&lt;T&gt;</code>:</p><pre>impl&lt;T&gt; Weak&lt;T&gt; {
+    fn data(&amp;self) -&gt; &amp;ArcData&lt;T&gt; {
+        unsafe { self.ptr.as_ref() }
+    }
+
+    …
+}</pre><p>In the <code>Deref</code> implementation for <code>Arc&lt;T&gt;</code>,
+we now have to use <code>UnsafeCell::<wbr>get()</code> to get a pointer to the contents of the cell,
+and use unsafe code to promise it can safely be shared at this point.
+We also need <code>as_<wbr>ref().unwrap()</code> to get a reference into the <code>Option&lt;T&gt;</code>.
+We don’t have to worry about this panicking,
+since the <code>Option</code> will only be <code>None</code> when there are no <code>Arc</code> objects left.</p><pre>impl&lt;T&gt; Deref for Arc&lt;T&gt; {
+    type Target = T;
+
+    fn deref(&amp;self) -&gt; &amp;T {
+        let ptr = self.weak.data().data.get();
+        // Safety: Since there's an Arc to the data,
+        // the data exists and may be shared.
+        unsafe { (*ptr).as_ref().unwrap() }
+    }
+}</pre><p>The <code>Clone</code> implementation for <code>Weak&lt;T&gt;</code> is quite straightforward;
+it’s pretty much identical to our previous <code>Clone</code> implementation for <code>Arc&lt;T&gt;</code>:</p><pre>impl&lt;T&gt; Clone for Weak&lt;T&gt; {
+    fn clone(&amp;self) -&gt; Self {
+        if self.data().alloc_ref_count.fetch_add(1, Relaxed) &gt; usize::MAX / 2 {
+            std::process::abort();
+        }
+        Weak { ptr: self.ptr }
+    }
+}</pre><p><a class="indexterm" id="index-Clonetrait-5"></a>
+In the <code>Clone</code> implementation for our new <code>Arc&lt;T&gt;</code>, we need to increment both counters.
+We’ll simply use <code>self.weak.clone()</code> to reuse the code above for the first counter,
+so we only have to manually increment the second counter:</p><pre>impl&lt;T&gt; Clone for Arc&lt;T&gt; {
+    fn clone(&amp;self) -&gt; Self {
+        let weak = self.weak.clone();
+        if weak.data().data_ref_count.fetch_add(1, Relaxed) &gt; usize::MAX / 2 {
+            std::process::abort();
+        }
+        Arc { weak }
+    }
+}</pre><p><a class="indexterm" id="index-Droptrait-9"></a>
+Dropping a <code>Weak</code> should decrement its counter and drop and deallocate the <code>ArcData</code> when the counter goes from one to zero.
+This is identical to what the <code>Drop</code> implementation of our previous <code>Arc</code> did.</p><pre>impl&lt;T&gt; Drop for Weak&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        if self.data().alloc_ref_count.fetch_sub(1, Release) == 1 {
+            fence(Acquire);
+            unsafe {
+                drop(Box::from_raw(self.ptr.as_ptr()));
+            }
+        }
+    }
+}</pre><p>Dropping an <code>Arc</code> should decrement both counters.
+Note that one of these is already automatically taken care of,
+since every <code>Arc</code> contains a <code>Weak</code>,
+such that dropping an <code>Arc</code> will also result in dropping a <code>Weak</code>.
+We only have to take care of the <span>other counter</span>:</p><pre>impl&lt;T&gt; Drop for Arc&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        if self.weak.data().data_ref_count.fetch_sub(1, Release) == 1 {
+            fence(Acquire);
+            let ptr = self.weak.data().data.get();
+            // Safety: The data reference counter is zero,
+            // so nothing will access it.
+            unsafe {
+                (*ptr) = None;
+            }
+        }
+    }
+}</pre><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p><a class="indexterm" id="index-Droptrait-10"></a> <a class="indexterm" id="index-dropfunction-3"></a>
+Dropping an object in Rust will first run its <code>Drop::<wbr>drop</code> function (if it implements <code>Drop</code>),
+and then drop all of its fields, one by <span>one, recursively</span>.</p></div></div><p>The check in the <code>get_<wbr>mut</code> method remains mostly unchanged, except it now needs to take weak pointers
+into account.
+It might seem like it could ignore weak pointers when checking for exclusivity,
+but a <code>Weak&lt;T&gt;</code> can be upgraded to an <code>Arc&lt;T&gt;</code> at any time.
+So, <code>get_<wbr>mut</code> will have to check that there are no other <code>Arc&lt;T&gt;</code> or <code>Weak&lt;T&gt;</code>
+pointers before it can give out a <code>&amp;mut T</code>:</p><pre>impl&lt;T&gt; Arc&lt;T&gt; {
+    …
+
+    pub fn get_mut(arc: &amp;mut Self) -&gt; Option&lt;&amp;mut T&gt; {
+        if arc.weak.data().alloc_ref_count.load(Relaxed) == 1 {
+            fence(Acquire);
+            // Safety: Nothing else can access the data, since
+            // there's only one Arc, to which we have exclusive access,
+            // and no Weak pointers.
+            let arcdata = unsafe { arc.weak.ptr.as_mut() };
+            let option = arcdata.data.get_mut();
+            // We know the data is still available since we
+            // have an Arc to it, so this won't panic.
+            let data = option.as_mut().unwrap();
+            Some(data)
+        } else {
+            None
+        }
+    }
+
+    …
+}</pre><p>Next up: upgrading a weak pointer.
+Upgrading a <code>Weak</code> to an <code>Arc</code> is only possible when the data still exists.
+If there are only weak pointers left, there’s no data left that can be shared through an <code>Arc</code>.
+So, we’ll have to increase the <code>Arc</code> counter, but can only do so if it isn’t already zero.
+We’ll use a compare-and-exchange loop (<a href="atomics.html#cas">"Compare-and-Exchange Operations" in Chapter 2</a>) to do this.</p><p>Just like before, relaxed memory ordering is fine for incrementing a reference counter.
+There are no operations on other variables
+that need to strictly happen before or after this atomic operation.</p><pre>impl&lt;T&gt; Weak&lt;T&gt; {
+    …
+
+    pub fn upgrade(&amp;self) -&gt; Option&lt;Arc&lt;T&gt;&gt; {
+        let mut n = self.data().data_ref_count.load(Relaxed);
+        loop {
+            if n == 0 {
+                return None;
+            }
+            assert!(n &lt;= usize::MAX / 2);
+            if let Err(e) =
+                self.data()
+                    .data_ref_count
+                    .compare_exchange_weak(n, n + 1, Relaxed, Relaxed)
+            {
+                n = e;
+                continue;
+            }
+            return Some(Arc { weak: self.clone() });
+        }
+    }
+}</pre><p>The opposite, getting a <code>Weak&lt;T&gt;</code> from an <code>Arc&lt;T&gt;</code>, is much simpler:</p><pre>impl&lt;T&gt; Arc&lt;T&gt; {
+    …
+
+    pub fn downgrade(arc: &amp;Self) -&gt; Weak&lt;T&gt; {
+        arc.weak.clone()
+    }
+}</pre><section id="arc-weak-test"><h3><a href="#arc-weak-test">Testing It</a></h3><p>To quickly test our creation, we’ll modify our previous unit test to
+use weak pointers and verify that they can be upgraded when expected:</p><pre>#[test]
+fn test() {
+    static NUM_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    struct DetectDrop;
+
+    impl Drop for DetectDrop {
+        fn drop(&amp;mut self) {
+            NUM_DROPS.fetch_add(1, Relaxed);
+        }
+    }
+
+    // Create an Arc with two weak pointers.
+    let x = Arc::new(("hello", DetectDrop));
+    let y = Arc::downgrade(&amp;x);
+    let z = Arc::downgrade(&amp;x);
+
+    let t = std::thread::spawn(move || {
+        // Weak pointer should be upgradable at this point.
+        let y = y.upgrade().unwrap();
+        assert_eq!(y.0, "hello");
+    });
+    assert_eq!(x.0, "hello");
+    t.join().unwrap();
+
+    // The data shouldn't be dropped yet,
+    // and the weak pointer should be upgradable.
+    assert_eq!(NUM_DROPS.load(Relaxed), 0);
+    assert!(z.upgrade().is_some());
+
+    drop(x);
+
+    // Now, the data should be dropped, and the
+    // weak pointer should no longer be upgradable.
+    assert_eq!(NUM_DROPS.load(Relaxed), 1);
+    assert!(z.upgrade().is_none());
+}</pre><p>This also compiles and runs without problems,
+which leaves us with a very usable handmade <code>Arc</code> implementation.</p></section></section><section id="optimizing-arc"><h2><a href="#optimizing-arc">Optimizing</a></h2><p><a class="indexterm" id="index-Arc-weakpointers-performancecost"></a>
+While weak pointers can be useful,
+the <code>Arc</code> type is often used without any weak pointers.
+A downside of our last implementation is that
+cloning and dropping an <code>Arc</code> now both take two atomic operations each,
+as they have to increment or decrement both counters.
+This makes all <code>Arc</code> users "pay" for the cost of weak pointers,
+even when they are not using them.</p><p>It might seem like the solution is to count <code>Arc&lt;T&gt;</code> and <code>Weak&lt;T&gt;</code> pointers separately,
+but then we wouldn’t be able to atomically check that both counters are zero.
+To understand how that’s a problem, imagine we have a
+thread executing the following annoying function:</p><pre>fn annoying(mut arc: Arc&lt;Something&gt;) {
+    loop {
+        let weak = Arc::downgrade(&amp;arc);
+        drop(arc);
+        println!("I have no Arc!"); <span class="callout">1</span>
+        arc = weak.upgrade().unwrap();
+        drop(weak);
+        println!("I have no Weak!"); <span class="callout">2</span>
+    }
+}</pre><p>This thread continuously downgrades and upgrades an <code>Arc</code>,
+such that it repeatedly cycles through moments where it holds no <code>Arc</code> (<span class="callout">1</span>), and moments where it holds no <code>Weak</code> (<span class="callout">2</span>).
+If we check both counters to see if there are any threads still using
+the allocation, this thread might be able to hide its existence
+if we are unlucky and check the <code>Arc</code> counter during its first print statement (<span class="callout">1</span>),
+but check the <code>Weak</code> counter during its second print statement (<span class="callout">2</span>).</p><p>In our last implementation, we solved this
+by counting every <code>Arc</code> also as a <code>Weak</code>.
+A more subtle way of solving this is to count all <code>Arc</code> pointers combined as one single <code>Weak</code> pointer.
+That way, the weak pointer counter (<code>alloc_<wbr>ref_<wbr>count</code>) never reaches zero as long as there is still at least one <code>Arc</code> object around, just like in our last implementation,
+but cloning an <code>Arc</code> doesn’t need to touch that counter at all.
+Only dropping the very last <code>Arc</code> will decrement the weak pointer counter too.</p><p>Let’s try that.</p><p>This time, we can’t just implement <code>Arc&lt;T&gt;</code> as a wrapper around <code>Weak&lt;T&gt;</code>,
+so both will wrap a non-null pointer to the allocation:</p><pre>pub struct Arc&lt;T&gt; {
+    ptr: NonNull&lt;ArcData&lt;T&gt;&gt;,
+}
+
+unsafe impl&lt;T: Sync + Send&gt; Send for Arc&lt;T&gt; {}
+unsafe impl&lt;T: Sync + Send&gt; Sync for Arc&lt;T&gt; {}
+
+pub struct Weak&lt;T&gt; {
+    ptr: NonNull&lt;ArcData&lt;T&gt;&gt;,
+}
+
+unsafe impl&lt;T: Sync + Send&gt; Send for Weak&lt;T&gt; {}
+unsafe impl&lt;T: Sync + Send&gt; Sync for Weak&lt;T&gt; {}</pre><p><a class="indexterm" id="index-ManuallyDrop"></a>
+Since we’re optimizing our implementation,
+we might as well make <code>ArcData&lt;T&gt;</code> slightly smaller by using a <code>std::<wbr>mem::<wbr>ManuallyDrop&lt;T&gt;</code>
+instead of an <code>Option&lt;T&gt;</code>.
+We used an <code>Option&lt;T&gt;</code> to be able to replace a <code>Some(T)</code> by <code>None</code> when dropping
+the data, but we don’t actually need a separate <code>None</code> state to tell us the data
+is gone, since the existence or absence of <code>Arc&lt;T&gt;</code> already tells us that.
+A <code>ManuallyDrop&lt;T&gt;</code> takes the exact same amount of space as a <code>T</code>,
+but allows us to manually drop it at any point by using an
+unsafe call to <code>ManuallyDrop::<wbr>drop()</code>:</p><pre>use std::mem::ManuallyDrop;
+
+struct ArcData&lt;T&gt; {
+    /// Number of `Arc`s.
+    data_ref_count: AtomicUsize,
+    /// Number of `Weak`s, plus one if there are any `Arc`s.
+    alloc_ref_count: AtomicUsize,
+    /// The data. Dropped if there are only weak pointers left.
+    data: UnsafeCell&lt;ManuallyDrop&lt;T&gt;&gt;,
+}</pre><p>The <code>Arc::<wbr>new</code> function remains almost unchanged,
+initializing both counters at once like before,
+but now using <code>ManuallyDrop::<wbr>new()</code> instead of <code>Some()</code>:</p><pre>impl&lt;T&gt; Arc&lt;T&gt; {
+    pub fn new(data: T) -&gt; Arc&lt;T&gt; {
+        Arc {
+            ptr: NonNull::from(Box::leak(Box::new(ArcData {
+                alloc_ref_count: AtomicUsize::new(1),
+                data_ref_count: AtomicUsize::new(1),
+                data: UnsafeCell::new(ManuallyDrop::new(data)),
+            }))),
+        }
+    }
+
+    …
+}</pre><p>The <code>Deref</code> implementation can no longer make use of the private <code>data</code> method on
+the <code>Weak</code> type, so we’ll add the same private helper function on <code>Arc&lt;T&gt;</code>:</p><pre>impl&lt;T&gt; Arc&lt;T&gt; {
+    …
+
+    fn data(&amp;self) -&gt; &amp;ArcData&lt;T&gt; {
+        unsafe { self.ptr.as_ref() }
+    }
+
+    …
+}
+
+impl&lt;T&gt; Deref for Arc&lt;T&gt; {
+    type Target = T;
+
+    fn deref(&amp;self) -&gt; &amp;T {
+        // Safety: Since there's an Arc to the data,
+        // the data exists and may be shared.
+        unsafe { &amp;*self.data().data.get() }
+    }
+}</pre><p>The <code>Clone</code> and <code>Drop</code> implementations for <code>Weak&lt;T&gt;</code> remain exactly the same as for our last implementation.
+Here they are for completeness, including the private <code>Weak::<wbr>data</code> helper function:</p><pre>impl&lt;T&gt; Weak&lt;T&gt; {
+    fn data(&amp;self) -&gt; &amp;ArcData&lt;T&gt; {
+        unsafe { self.ptr.as_ref() }
+    }
+
+    …
+}
+
+impl&lt;T&gt; Clone for Weak&lt;T&gt; {
+    fn clone(&amp;self) -&gt; Self {
+        if self.data().alloc_ref_count.fetch_add(1, Relaxed) &gt; usize::MAX / 2 {
+            std::process::abort();
+        }
+        Weak { ptr: self.ptr }
+    }
+}
+
+impl&lt;T&gt; Drop for Weak&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        if self.data().alloc_ref_count.fetch_sub(1, Release) == 1 {
+            fence(Acquire);
+            unsafe {
+                drop(Box::from_raw(self.ptr.as_ptr()));
+            }
+        }
+    }
+}</pre><p>And now we get to the part that this new optimized implementation was all
+about—cloning an <code>Arc&lt;T&gt;</code> now needs to touch only one counter:</p><pre>impl&lt;T&gt; Clone for Arc&lt;T&gt; {
+    fn clone(&amp;self) -&gt; Self {
+        if self.data().data_ref_count.fetch_add(1, Relaxed) &gt; usize::MAX / 2 {
+            std::process::abort();
+        }
+        Arc { ptr: self.ptr }
+    }
+}</pre><p><a class="indexterm" id="index-Droptrait-11"></a>
+Similarly, dropping an <code>Arc&lt;T&gt;</code> now needs to decrement only one counter,
+except for the last drop that sees that counter go from one to zero.
+In that case, the weak pointer counter also needs to be decremented,
+such that it can reach zero once there are no weak pointers left.
+We do this by simply creating a <code>Weak&lt;T&gt;</code> out of thin air and immediately dropping it:</p><pre>impl&lt;T&gt; Drop for Arc&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        if self.data().data_ref_count.fetch_sub(1, Release) == 1 {
+            fence(Acquire);
+            // Safety: The data reference counter is zero,
+            // so nothing will access the data anymore.
+            unsafe {
+                ManuallyDrop::drop(&amp;mut *self.data().data.get());
+            }
+            // Now that there's no `Arc&lt;T&gt;`s left,
+            // drop the implicit weak pointer that represented all `Arc&lt;T&gt;`s.
+            drop(Weak { ptr: self.ptr });
+        }
+    }
+}</pre><p>The <code>upgrade</code> method on <code>Weak&lt;T&gt;</code> remains mostly the same,
+except it no longer clones a weak pointer, since it doesn’t need to increment
+the weak pointer counter anymore.
+Upgrading only succeeds if there is already at least one <code>Arc&lt;T&gt;</code> to the allocation,
+which means that <code>Arc</code>s are already accounted for in the weak pointer counter.</p><pre>impl&lt;T&gt; Weak&lt;T&gt; {
+    …
+
+    pub fn upgrade(&amp;self) -&gt; Option&lt;Arc&lt;T&gt;&gt; {
+        let mut n = self.data().data_ref_count.load(Relaxed);
+        loop {
+            if n == 0 {
+                return None;
+            }
+            assert!(n &lt;= usize::MAX / 2);
+            if let Err(e) =
+                self.data()
+                    .data_ref_count
+                    .compare_exchange_weak(n, n + 1, Relaxed, Relaxed)
+            {
+                n = e;
+                continue;
+            }
+            return Some(Arc { ptr: self.ptr });
+        }
+    }
+}</pre><p>So far the differences between this and our previous implementation are very minimal.
+Where things get tricky, though, is with the last two methods we still need to implement:
+<code>downgrade</code> and <code>get_<wbr>mut</code>.</p><p>Unlike before, the <code>get_<wbr>mut</code> method now needs to check if both counters are set to one
+to be able to determine whether there’s only one <code>Arc&lt;T&gt;</code> and no <code>Weak&lt;T&gt;</code> left,
+since a weak pointer counter of one can now represent multiple <code>Arc&lt;T&gt;</code> pointers.
+Reading the counters are two separate operations that happen at (slightly)
+different times, so we have to be very careful to not miss any concurrent downgrades,
+such as in the example case we saw at the start of <a href="#optimizing-arc">"Optimizing"</a>.</p><p>If we first check that <code>data_<wbr>ref_<wbr>count</code> is one, then
+we could miss a subsequent <code>upgrade()</code> before we check the other counter.
+But, if we first check that <code>alloc_<wbr>ref_<wbr>count</code> is one, then
+we could miss a subsequent <code>downgrade()</code> before we check the other counter.</p><p>A way out of this dilemma is to briefly block the <code>downgrade()</code> operation by "locking"
+the weak pointer counter.
+To do that, we don’t need anything like a mutex.
+We can use a special value, like <code>usize::<wbr>MAX</code>, to represent a special "locked" state
+of the weak pointer counter.
+It’ll only be locked very briefly, only to load the other counter,
+so the <code>downgrade</code> method could just spin until it’s unlocked,
+in the unlikely situation it runs at the exact same moment as <code>get_<wbr>mut</code>.</p><p>So, in <code>get_<wbr>mut</code> we’ll first have to check if <code>alloc_<wbr>ref_<wbr>count</code> is one
+and at the same time replace it by <code>usize::<wbr>MAX</code>, if it was indeed one.
+That’s a job for <code>compare_<wbr>exchange</code>.</p><p>Then we’ll have to check if the other counter is also one,
+after which we can immediately unlock the weak pointer counter.
+If the second counter is also one, we know we have exclusive access to the allocation
+and the data, such that we can return a <code>&amp;mut T</code>.
+<a class="indexterm" id="index-compare-and-exchangeoperationsatomic-usingtolockreferencecounter"></a> <a class="indexterm" id="index-atomic-compare-and-exchangeoperations-usingtolockreferencecounter"></a></p><pre>    pub fn get_mut(arc: &amp;mut Self) -&gt; Option&lt;&amp;mut T&gt; {
+        // Acquire matches Weak::drop's Release decrement, to make sure any
+        // upgraded pointers are visible in the next data_ref_count.load.
+        if arc.data().alloc_ref_count.compare_exchange(
+            1, usize::MAX, Acquire, Relaxed
+        ).is_err() {
+            return None;
+        }
+        let is_unique = arc.data().data_ref_count.load(Relaxed) == 1;
+        // Release matches Acquire increment in `downgrade`, to make sure any
+        // changes to the data_ref_count that come after `downgrade` don't
+        // change the is_unique result above.
+        arc.data().alloc_ref_count.store(1, Release);
+        if !is_unique {
+            return None;
+        }
+        // Acquire to match Arc::drop's Release decrement, to make sure nothing
+        // else is accessing the data.
+        fence(Acquire);
+        unsafe { Some(&amp;mut *arc.data().data.get()) }
+    }</pre><p>As you might have expected,
+the locking operation (the <code>compare_<wbr>exchange</code>) will have to use <code>Acquire</code> memory ordering,
+and the unlocking operation (the <code>store</code>) will have to use <code>Release</code> memory ordering.
+<a class="indexterm" id="index-Arc-memoryordering-3"></a> <a class="indexterm" id="index-releaseandacquirememoryordering-referencecounting-3"></a> <a class="indexterm" id="index-memoryordering-referencecounting-4"></a></p><p>If we had used <code>Relaxed</code> for the <code>compare_<wbr>exchange</code> instead,
+it would have been possible for the subsequent <code>load</code> from <code>data_<wbr>ref_<wbr>count</code>
+to not see the new value of a freshly upgraded <code>Weak</code> pointer, even though the <code>compare_<wbr>exchange</code> had already
+confirmed that every <code>Weak</code> pointer had been dropped.</p><p>If we had used <code>Relaxed</code> for the <code>store</code>, it would have been possible for the preceding <code>load</code> to
+observe the result of a future <code>Arc::<wbr>drop</code> for an <code>Arc</code> that can still be <span>downgraded</span>.</p><p><a class="indexterm" id="index-fences-3"></a> <a class="indexterm" id="index-memoryordering-fences-3"></a> <a class="indexterm" id="index-releaseandacquirememoryordering-acquirefence-5"></a>
+The acquire fence is the same as before: it synchronizes with the release-decrement operation
+in <code>Arc::<wbr>Drop</code> to make sure every access through former <code>Arc</code> clones has happened before the new exclusive access.</p><p>The last piece of the puzzle is the <code>downgrade</code> method,
+which will have to check for the special <code>usize::<wbr>MAX</code> value to see
+if the weak pointer counter is locked, and spin until it is unlocked.
+<a class="indexterm" id="index-spinning-2"></a>
+Just like in the <code>upgrade</code> implementation,
+we’ll use a compare-and-exchange loop to
+check for the special value and overflow before incrementing <span>the counter</span>:</p><pre>    pub fn downgrade(arc: &amp;Self) -&gt; Weak&lt;T&gt; {
+        let mut n = arc.data().alloc_ref_count.load(Relaxed);
+        loop {
+            if n == usize::MAX {
+                std::hint::spin_loop();
+                n = arc.data().alloc_ref_count.load(Relaxed);
+                continue;
+            }
+            assert!(n &lt;= usize::MAX / 2);
+            // Acquire synchronises with get_mut's release-store.
+            if let Err(e) =
+                arc.data()
+                    .alloc_ref_count
+                    .compare_exchange_weak(n, n + 1, Acquire, Relaxed)
+            {
+                n = e;
+                continue;
+            }
+            return Weak { ptr: arc.ptr };
+        }
+    }</pre><p><a class="indexterm" id="index-releaseandacquirememoryordering-referencecounting-4"></a> <a class="indexterm" id="index-memoryordering-referencecounting-5"></a> <a class="indexterm" id="index-Arc-memoryordering-4"></a>
+We use acquire memory ordering for <code>compare_<wbr>exchange_<wbr>weak</code>,
+which synchronizes with the release-store in the <code>get_<wbr>mut</code> function.
+Otherwise, it would be possible for the effect of a subsequent <code>Arc::<wbr>drop</code>
+to be visible to a thread running <code>get_<wbr>mut</code> before it unlocks the counter.</p><p>In other words, the acquire compare-and-exchange operation here
+effectively "locks" <code>get_<wbr>mut</code>, preventing it from succeeding.
+It can be "unlocked" again by a later <code>Weak::<wbr>drop</code> that decrements the counter back to one, using release memory ordering.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>The optimized implementation of <code>Arc&lt;T&gt;</code> and <code>Weak&lt;T&gt;</code> that we just made
+is nearly identical to the one included in the Rust <span>standard library</span>.</p></div></div><p>If we run the exact same test as before (<a href="#arc-weak-test">"Testing It"</a>),
+we see that this optimized implementation also compiles and passes our tests.</p><div class="note" role="note" aria-label="tip"><div class="icon" aria-hidden="true"><i class="tip"></i></div><div class="text"><p>If you feel that getting the memory ordering decisions right for this optimized implementation was difficult, don’t worry.
+Many concurrent data structures are simpler to implement correctly than this one.
+This <code>Arc</code> implementation is included in this chapter specifically because of its tricky subtleties around memory ordering.</p></div></div></section><section id="summary"><h2><a href="#summary">Summary</a></h2><ul><li><p><code>Arc&lt;T&gt;</code> provides shared ownership of a reference-counted allocation.</p></li><li><p>By checking if the reference counter is exactly one, an <code>Arc&lt;T&gt;</code> can conditionally
+provide exclusive access (<code>&amp;mut T</code>).</p></li><li><p>Incrementing the atomic reference counter can be done using a relaxed operation,
+but the final decrement must synchronize with all previous decrements.</p></li><li><p>A <em>weak pointer</em> (<code>Weak&lt;T&gt;</code>) can be used to avoid cycles.</p></li><li><p>The <code>NonNull&lt;T&gt;</code> type represents a pointer to <code>T</code> that is never null.</p></li><li><p>The <code>ManuallyDrop&lt;T&gt;</code> type can be used to manually decide, using <code>unsafe</code> code, when to drop a <code>T</code>.</p></li><li><p>As soon as more than one atomic variable is involved, things get more <span>complicated</span>.</p></li><li><p>Implementing an ad hoc (spin) lock can sometimes be a valid strategy for
+  operating on multiple atomic variables at once.
+ </p></li></ul></section></article><nav class="next"><a href="hardware.html">Next: Chapter 7. Understanding the Processor</a></nav></div>
+<footer>
+<p><a href=".">Rust Atomics and Locks</a><br>&copy; 2023 ♥ Mara Bos</p>
+<p><a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/"><img alt="Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License" src="https://i.creativecommons.org/l/by-nc-nd/4.0/88x31.png"></a></p>
+<p class="report-issue"><a href="https://github.com/m-ou-se/rust-atomics-and-locks/issues/">Report an issue</a></p>
+</footer>
+</body>
+</html>

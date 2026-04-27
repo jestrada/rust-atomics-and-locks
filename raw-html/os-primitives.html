@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust Atomics and Locks — Chapter 8. Operating System Primitives</title>
+<meta name="author" content="Mara Bos">
+<meta name="theme-color" content="#FF69B4">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="site">
+<nav class="index">
+<a href=".">Rust Atomics and Locks</a>
+</nav>
+<article id="os-primitives"><h1><a href="">Chapter 8. Operating System Primitives</a></h1><p><a class="indexterm" id="index-blocking"></a>
+So far, we’ve mostly focused on non-blocking operations.
+If we want to implement something like a mutex or condition variable,
+something that can wait for another thread to unlock or notify it,
+we need a way to efficiently block the current thread.</p><p><a class="indexterm" id="index-operatingsystems"></a> <a class="indexterm" id="index-spinning-3"></a>
+As we saw in <a href="building-spinlock.html">Chapter 4</a>,
+we can do this ourselves without the help of the operating system by
+<em>spinning</em>, repeatedly trying something over and over again,
+which can easily waste a lot of processor time.
+If we want to block efficiently, however,
+we need the help of the operating system’s kernel.</p><p><a class="indexterm" id="index-kernel-2"></a> <a class="indexterm" id="index-scheduler"></a>
+The kernel, or more specifically the <em>scheduler</em> part of it,
+is responsible for deciding which process or thread gets to run when,
+for how long, and on which processor core.
+While a thread is waiting for something to happen,
+the kernel can stop giving it any processor time,
+prioritizing other threads that can make better use of this scarce resource.</p><p>We’ll need a way to inform the kernel that we’re waiting for something and ask it to put our thread to sleep until something relevant happens.</p><section id="interfacing-with-the-kernel"><h2><a href="#interfacing-with-the-kernel">Interfacing with the Kernel</a></h2><p><a class="indexterm" id="index-kernel-interfacingwith"></a>
+The way things are communicated with the kernel depends heavily on the
+operating system, and often even its version.
+Usually, the details of how this works are hidden behind one or more libraries
+that handle this for us. For example, using the Rust standard library,
+we can just call <code>File::<wbr>open()</code> to open a file, without having to know any
+details about the operating system’s kernel interface.
+<a class="indexterm" id="index-libc"></a> <a class="indexterm" id="index-Cstandardlibrary"></a>
+Similarly, using the C standard library, <code>libc</code>,
+one can call the standard <code>fopen()</code> function to open a file.
+<a class="indexterm" id="index-syscalls"></a>
+Calling such a function will eventually result in a call into the operating system’s kernel, also known as a <em>syscall</em>,
+which is usually done through a specialized processor instruction.
+(On some architectures, that instruction is literally called <code>syscall</code>.)</p><p><a class="indexterm" id="index-operatingsystems-librariesshippedwith"></a>
+Programs are generally expected, sometimes even required, to not make any
+syscalls directly, but to make use of higher level libraries that shipped with the operating system.
+<a class="indexterm" id="index-Unixsystems-libcroleof"></a> <a class="indexterm" id="index-Linux-libcroleof"></a>
+On Unix systems, such as those based on Linux, <code>libc</code> takes this special role of providing the standard interface to the kernel.</p><p><a class="indexterm" id="index-POSIX"></a> <a class="indexterm" id="index-Linux-interfacingwiththekernel"></a> <a class="indexterm" id="index-Unixsystems-interfacingwiththekernel"></a>
+The "Portable Operating System Interface" standard, more commonly known as the POSIX standard,
+includes additional requirements for <code>libc</code> on Unix systems.
+For example, next to the <code>fopen()</code> function from the C standard,
+POSIX additionally requires the existence of the lower-level <code>open()</code> and <code>openat()</code>
+functions for opening files, which often correspond directly with a syscall.
+Because of the special status of <code>libc</code> on Unix systems,
+programs written in languages other than C usually still use <code>libc</code> for all their interactions with the kernel.</p><p>Rust software, including the standard library, often makes use of <code>libc</code> through the identically named <code>libc</code> crate.</p><p>For Linux specifically, the syscall interface is guaranteed to be stable,
+allowing us to make syscalls directly, without using <code>libc</code>.
+While that’s not the most common or most advised route, it is slowly becoming more popular.</p><p><a class="indexterm" id="index-macOS-interfacingwiththekernel"></a>
+However, on macOS, also a Unix operating system that follows the POSIX standard,
+the syscall interface of the kernel is not stable, and we’re not supposed to use it directly.
+The only stable interfaces that programs are allowed to use are provided through the libraries
+that ship with the system, such as <code>libc</code>, <code>libc++</code>, and various other libraries for
+C, C++, Objective-C, and Swift, Apple’s programming languages of choice.</p><p><a class="indexterm" id="index-Windows-interfacingwiththekernel"></a>
+Windows does not follow the POSIX standard.
+It does not ship with an extended <code>libc</code> that serves as the main interface to the kernel,
+but instead ships with a separate set of libraries, such as <code>kernel32.dll</code>,
+that provide Windows-specific functions, such as <code>CreateFileW</code> for opening files.
+Just like on macOS, we’re not supposed to make use of undocumented lower-level
+functions or make syscalls directly.</p><p><a class="indexterm" id="index-operatingsystems-synchronizationprimitives"></a>
+Through their libraries, operating systems provide us with synchronization
+primitives that need to interact with the kernel, such as mutexes and condition variables.
+Which part of their implementation is part of such a library or part of the kernel varies heavily per operating system.
+For example, sometimes the mutex lock and unlock operations correspond directly with a kernel syscall,
+whereas on other systems, the library handles most of the operations and will only perform a syscall when a thread needs to be blocked or woken up.
+(The latter tends to be more efficient, as making a syscall can be slow.)
+</p></section><section id="posix"><h2><a href="#posix">POSIX</a></h2><p><a class="indexterm" id="index-POSIX-pthreads"></a> <a class="indexterm" id="index-pthreads"></a> <a class="indexterm" id="index-libc-pthreadsfunctionalityin"></a> <a class="indexterm" id="index-libpthread"></a>
+As part of the POSIX Threads extensions, better known as pthreads,
+POSIX specifies data types and functions for concurrency.
+While technically specified as part of a separate system library, <code>libpthread</code>,
+this functionality is nowadays often included in <code>libc</code> directly.</p><p>Next to functionality like spawning and joining threads (<code>pthread_<wbr>create</code> and <code>pthread_<wbr>join</code>),
+pthread provides the most common synchronization primitives:
+mutexes (<code>pthread_<wbr>mutex_<wbr>t</code>),
+reader-writer locks (<code>pthread_<wbr>rwlock_<wbr>t</code>), and condition variables (<code>pthread_<wbr>cond_<wbr>t</code>).</p><dl><dt><code>pthread_<wbr>mutex_<wbr>t</code></dt><dd><p><a class="indexterm" id="index-pthreads-pthreadmutext"></a> <a class="indexterm" id="index-mutexes-pthreadmutext"></a>
+Pthread’s mutex must be initialized by calling <code>pthread_<wbr>mutex_<wbr>init()</code> and destroyed with <code>pthread_<wbr>mutex_<wbr>destroy()</code>.
+The initialization function takes an argument of type <code>pthread_<wbr>mutexattr_<wbr>t</code> that can be used to configure
+some of the properties of the mutex.</p><p>One of those properties is its behavior on <em>recursive locking</em>, which happens when the same thread that already holds a lock,
+attempts to lock it again.
+<a class="indexterm" id="index-recursivelocking"></a>
+This results in undefined behavior when using the default setting (<code>PTHREAD_<wbr>MUTEX_<wbr>DEFAULT</code>),
+but it can also be configured to result in an error (<code>PTHREAD_<wbr>MUTEX_<wbr>ERRORCHECK</code>),
+in a deadlock (<code>PTHREAD_<wbr>MUTEX_<wbr>NORMAL</code>),
+or in a successful second lock (<code>PTHREAD_<wbr>MUTEX_<wbr>RECURSIVE</code>).</p><p>These mutexes are locked through <code>pthread_<wbr>mutex_<wbr>lock()</code> or <code>pthread_<wbr>mutex_<wbr>trylock()</code>, and unlocked through <code>pthread_<wbr>mutex_<wbr>unlock()</code>.
+Additionally, unlike Rust’s standard mutex, they also support locking with a time limit, through <code>pthread_<wbr>mutex_<wbr>timedlock()</code>.</p><p>A <code>pthread_<wbr>mutex_<wbr>t</code> can be statically initialized without a call to <code>pthread_<wbr>mutex_<wbr>init()</code>
+by assigning it the value <code>PTHREAD_<wbr>MUTEX_<wbr>INITIALIZER</code>.
+However, this is only possible for a mutex with default settings.</p></dd><dt><code>pthread_<wbr>rwlock_<wbr>t</code></dt><dd><p><a class="indexterm" id="index-pthreads-pthreadrwlockt"></a> <a class="indexterm" id="index-reader-writerlocks-pthreadrwlockt"></a>
+Pthread’s reader-writer lock is initialized and destroyed through
+<code>pthread_<wbr>rwlock_<wbr>init()</code> and <code>pthread_<wbr>rwlock_<wbr>destroy()</code>.
+Similar to a mutex, a default <code>pthread_<wbr>rwlock_<wbr>t</code> can also be initialized statically
+with <code>PTHREAD_<wbr>RWLOCK_<wbr>INITIALIZER</code>.</p><p>A pthread reader-writer lock has significantly fewer properties that can be configured
+through its initialization function, compared to a pthread mutex.
+Most notably, attempting to recursively write-lock it will always result in a deadlock.</p><p>Attempts to recursively acquire additional read locks, however, are guaranteed to succeed,
+even if there are writers waiting.
+This effectively rules out any efficient implementation that prioritizes writers over readers,
+which is why most pthread implementations prioritize readers.</p><p>Its interface is nearly identical to that of <code>pthread_<wbr>mutex_<wbr>t</code>,
+including support for time limits, except each locking function comes in two variants:
+one for readers (<code>pthread_<wbr>rwlock_<wbr>rdlock</code>), and one for writers (<code>pthread_<wbr>rwlock_<wbr>wrlock</code>).
+Perhaps surprisingly, there is only one unlock function (<code>pthread_<wbr>rwlock_<wbr>unlock</code>)
+that’s used for unlocking a lock of either kind.</p></dd><dt><code>pthread_<wbr>cond_<wbr>t</code></dt><dd><p><a class="indexterm" id="index-pthreads-pthreadcondt"></a> <a class="indexterm" id="index-conditionvariables-pthreadcondt"></a>
+A pthread condition variable is used together with a pthread mutex.
+It is initialized and destroyed through <code>pthread_<wbr>cond_<wbr>init</code> and <code>pthread_<wbr>cond_<wbr>destroy</code>,
+and has a few attributes that can be configured.
+Most notably, we can configure whether time limits will use a monotonic clock (like Rust’s <code>Instant</code>)
+or real-time clock (like Rust’s <code>SystemTime</code>, somtimes called "wall-clock time").
+A condition variable with default settings, such as one statically
+initialized by <code>PTHREAD_<wbr>COND_<wbr>INITIALIZER</code>, uses the real-time clock.</p><p>Waiting for such a condition variable, optionally with a time limit,
+is done through <code>pthread_<wbr>cond_<wbr>timedwait()</code>.
+Waking up a waiting thread is done by calling <code>pthread_<wbr>cond_<wbr>signal()</code>,
+or, to wake all waiting threads at once, <code>pthread_<wbr>cond_<wbr>broadcast()</code>.</p></dd></dl><p>The remaining synchronization primitives provided by pthread are
+barriers (<code>pthread_<wbr>barrier_<wbr>t</code>), spin locks (<code>pthread_<wbr>spinlock_<wbr>t</code>), and
+one-time initialization (<code>pthread_<wbr>once_<wbr>t</code>), which we will not discuss.</p><section id="wrapping-in-rust"><h3><a href="#wrapping-in-rust">Wrapping in Rust</a></h3><p><a class="indexterm" id="index-pthreads-wrappinginRust"></a> <a class="indexterm" id="index-mutexes-pthread-wrappinginRust"></a>
+It might seem like we could easily expose these pthread synchronization primitives
+to Rust by conveniently wrapping their C type (through the <code>libc</code> crate)
+in a Rust struct, like this:</p><pre>pub struct Mutex {
+    m: libc::pthread_mutex_t,
+}</pre><p>However, there are a few issues with that, as this pthread type was designed for C, not for Rust.</p><p>First of all, Rust has rules about mutability and borrowing,
+which normally don’t allow for mutations to something when shared.
+Since functions like <code>pthread_<wbr>mutex_<wbr>lock</code> will most likely mutate the mutex,
+we’ll need interior mutability to make sure that’s acceptable.
+So, we’ll have to wrap it in an <code>UnsafeCell</code>:</p><pre>pub struct Mutex {
+    m: UnsafeCell&lt;libc::pthread_mutex_t&gt;,
+}</pre><p>A much bigger problem is related to <em>moving</em>.</p><p>In Rust, we move objects around all the time.
+For example, by returning an object from a function,
+passing it as an argument, or simply assigning it to a new place.
+Everything that we own (and that isn’t borrowed by anything else),
+we can freely move into a new place.</p><p>In C, however, that’s not universally true.
+It’s quite common for a type in C to depend on its memory address staying constant.
+For example, it might contain a pointer that points into itself,
+or store a pointer to itself in some global data structure.
+In that case, moving it to a new place could result in undefined behavior.</p><p><a class="indexterm" id="index-movablenot-pthreadtypes"></a> <a class="indexterm" id="index-unmovable-pthreadtypes"></a>
+The pthread types we discussed do not guarantee they are <em>movable</em>,
+which becomes quite a problem in Rust.
+Even a simple idiomatic <code>Mutex::<wbr>new()</code> function is a problem:
+it would return a mutex object, which would move it into a new place <span>in memory</span>.</p><p><a class="indexterm" id="index-unmovable-Pin"></a> <a class="indexterm" id="index-movablenot-Pin"></a> <a class="indexterm" id="index-Pin"></a>
+Since a user could always move around any mutex object they own,
+we either need to make them promise they won’t do that, by making the interface <code>unsafe</code>;
+or we need to take away their ownership and hide everything behind a wrapper (something that <code>std::<wbr>pin::<wbr>Pin</code> can be used for).
+Neither of these are good solutions, as they impact the interface of our mutex type,
+making it very error-prone and/or inconvenient <span>to use</span>.</p><p><a class="indexterm" id="index-unmovable-wrappinginBox"></a> <a class="indexterm" id="index-movablenot-wrappinginBox"></a> <a class="indexterm" id="index-Box-unmovabletypewrappingin"></a> <a class="indexterm" id="index-wrappingunmovableobjectinBox"></a>
+A solution to this problem is to wrap the mutex in a <code>Box</code>.
+By putting the pthread mutex in its own allocation,
+it stays in the same location in memory, even if its owner is moved around.</p><pre>pub struct Mutex {
+    m: Box&lt;UnsafeCell&lt;libc::pthread_mutex_t&gt;&gt;,
+}</pre><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>This is how <code>std::<wbr>sync::<wbr>Mutex</code> was implemented on all Unix platforms before Rust 1.62.</p></div></div><p>The downside of this approach is the overhead: every mutex now gets its own allocation,
+adding significant overhead to creating, destroying, and using the mutex.
+Another downside is that it prevents the <code>new</code> function from being <code>const</code>,
+which gets in the way of having a <code>static</code> mutex.</p><p>Even if <code>pthread_<wbr>mutex_<wbr>t</code> was movable, a <code>const fn new</code> could only initialize
+it with default settings, which results in undefined behavior when locking recursively.
+There is no way to design a safe interface that prevents locking recursively,
+so this means we’d need to make the <code>lock</code> function <code>unsafe</code> to make the user promise they won’t <span>do that</span>.</p><p><a class="indexterm" id="index-pthreads-pthreadmutext-droppingwhilelocked"></a>
+A problem that remains with our <code>Box</code> approach occurs when dropping a locked mutex.
+It might seem that, with the right design, it would not be possible to drop a
+<code>Mutex</code> while locked, since it’s impossible to drop it while it’s still borrowed by a <code>MutexGuard</code>.
+The <code>MutexGuard</code> would have to be dropped first, unlocking the <code>Mutex</code>.
+<a class="indexterm" id="index-leaking-aMutexGuard"></a>
+However, in Rust, it’s safe to forget (or leak) an object, without dropping it.
+This means one could write something like this:</p><pre>fn main() {
+    let m = Mutex::new(..);
+
+    let guard = m.lock(); // Lock it ..
+    std::mem::forget(guard); // .. but don't unlock it.
+}</pre><p>In the example above, <code>m</code> will be dropped at the end of the scope
+while it is still locked.
+This is fine, according to the Rust compiler, because the guard has been leaked
+and can’t be used anymore.</p><p>However, pthread specifies that calling <code>pthread_<wbr>mutex_<wbr>destroy()</code> on a locked mutex
+is not guaranteed to work and might result in undefined behavior.
+One work-around is to first attempt to lock (and unlock) the pthread mutex
+when dropping our <code>Mutex</code>, and panic (or leak the <code>Box</code>) when it is already
+locked, but that adds even <span>more overhead</span>.</p><p>These issues don’t just apply to <code>pthread_<wbr>mutex_<wbr>t</code>, but to the other types we discussed as well.
+Overall, the design of the pthread synchronization primitives is fine for C,
+but just not a great fit for Rust.
+ </p></section></section><section id="linux"><h2><a href="#linux">Linux</a></h2><p><a class="indexterm" id="index-futex"></a>
+On Linux systems, the pthread synchronization primitives are all implemented using
+the <em>futex</em> syscall.
+Its name comes from "fast user-space mutex," as the original motivation for
+adding this syscall was to allow libraries (like pthread implementations) to
+include a fast and efficient mutex implementation.
+It’s much more flexible than that though and can be used to build many
+different synchronization tools.</p><p>The futex syscall was added to the Linux kernel in 2003 and has seen several improvements and extensions since then.
+Some other operating systems have since also added similar
+functionality, most notably Windows 8 in 2012
+with the addition of <code>WaitOnAddress</code> (which we’ll discuss a bit later, in <a href="#windows">"Windows"</a>).
+In 2020, the C++ language even added support for basic futex-like operations to
+its standard library, with the addition of the <code>atomic_<wbr>wait</code> and <code>atomic_<wbr>notify</code> functions.</p><section id="futex"><h3><a href="#futex">Futex</a></h3><p><a class="indexterm" id="index-Linux-futexsyscall"></a> <a class="indexterm" id="index-SYSfutexLinux"></a>
+On Linux, <code>SYS_<wbr>futex</code> is a syscall that implements various operations
+that all operate on a 32-bit atomic integer.
+The main two operations are <code>FUTEX_<wbr>WAIT</code> and <code>FUTEX_<wbr>WAKE</code>.
+<a class="indexterm" id="index-blocking-futexwaitoperation"></a> <a class="indexterm" id="index-futex-waitoperation"></a> <a class="indexterm" id="index-futex-wakeoperation"></a>
+The wait operation puts a thread to sleep,
+and a wake operation on the same atomic variable wakes the thread up again.</p><p>These operations don’t store anything in the atomic integer.
+Instead, the kernel remembers which threads are waiting on which memory address to allow a wake operation to wake up the right threads.</p><p>In <a href="basics.html#waiting">"Waiting: Parking and Condition Variables" in Chapter 1</a>, we saw how other mechanisms for blocking and waking up threads
+need a way to make sure that wake operations don’t get lost in a race.
+For thread parking, that issue is solved by making the <code>unpark()</code> operation also apply
+to future <code>park()</code> operations as well.
+<a class="indexterm" id="index-threadparking-4"></a>
+And for condition variables, that’s taken care of by the mutex that is used
+together with the condition variable.</p><p>For the futex wait and wake operations, another mechanism is used.
+The wait operation takes an argument which specifies the value we
+expect the atomic variable to have and will refuse to block if it doesn’t match.
+The wait operation behaves atomically with respect to the wake operation,
+meaning that no wake signal can get lost between the check of the expected value and the moment it actually goes to sleep.</p><p>If we make sure that the value of the atomic variable is changed right before
+a wake operation, we can be sure that a thread that’s about to start waiting will
+not go to sleep, such that potentially missing the futex wake operation no longer matters.</p><p>Let’s go over a minimal example to see this in practice.</p><p>First, we need to be able to invoke these syscalls.
+We can use the <code>syscall</code> function from the <code>libc</code> crate to do so,
+and wrap each of them in a convenient Rust function, <span>as follows</span>:</p><pre>#[cfg(not(target_os = "linux"))]
+compile_error!("Linux only. Sorry!");
+
+pub fn wait(a: &amp;AtomicU32, expected: u32) {
+    // Refer to the futex (2) man page for the syscall signature.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex, // The futex syscall.
+            a as *const AtomicU32, // The atomic to operate on.
+            libc::FUTEX_WAIT, // The futex operation.
+            expected, // The expected value.
+            std::ptr::null::&lt;libc::timespec&gt;(), // No timeout.
+        );
+    }
+}
+
+pub fn wake_one(a: &amp;AtomicU32) {
+    // Refer to the futex (2) man page for the syscall signature.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex, // The futex syscall.
+            a as *const AtomicU32, // The atomic to operate on.
+            libc::FUTEX_WAKE, // The futex operation.
+            1, // The number of threads to wake up.
+        );
+    }
+}</pre><p><a class="indexterm" id="index-futex-example"></a>
+Now, as a usage example, let’s use these to make a thread wait for another.
+We’ll use an atomic variable that we initialize at zero, which the main thread will futex-wait on.
+A second thread will change the variable to one, and then run a futex wake operation on it to wake up the main thread.</p><p><a class="indexterm" id="index-futex-spuriouswake-ups"></a> <a class="indexterm" id="index-spuriouswake-ups-2"></a>
+Just like thread parking and waiting on a condition variable,
+a futex wait operation can <em>spuriously</em> wake up, even when nothing happened.
+Therefore, it is most commonly used in a loop, repeating it if the condition we’re waiting for isn’t met yet.</p><p>Let’s take a look at the example below:</p><pre>fn main() {
+    let a = AtomicU32::new(0);
+
+    thread::scope(|s| {
+        s.spawn(|| {
+            thread::sleep(Duration::from_secs(3));
+            a.store(1, Relaxed); <span class="callout">1</span>
+            wake_one(&amp;a); <span class="callout">2</span>
+        });
+
+        println!("Waiting...");
+        while a.load(Relaxed) == 0 { <span class="callout">3</span>
+            wait(&amp;a, 0); <span class="callout">4</span>
+        }
+        println!("Done!");
+    });
+}</pre><table class="callouts"><tr><td><span class="callout">1</span><td><p>The spawned thread will set the atomic variable to one after a few seconds.</p><tr><td><span class="callout">2</span><td><p>It then executes a futex wake operation to wake up the main thread,
+in case it was sleeping, so it can see that the variable has changed.</p><tr><td><span class="callout">3</span><td><p>The main thread waits as long as the variable is zero,
+before continuing to print its final message.</p><tr><td><span class="callout">4</span><td><p>The futex wait operation is used to put the thread to sleep.
+Very importantly, this operation will check whether <code>a</code> is still zero
+before going to sleep, which is the reason that the signal from the
+spawned thread cannot get lost between <span class="callout">3</span> and <span class="callout">4</span>.
+Either <span class="callout">1</span> (and therefore <span class="callout">2</span>) did not happen yet and it goes to sleep,
+or <span class="callout">1</span> (and maybe <span class="callout">2</span>) already happened, and it immediately continues.</p></table><p>An important observation to make here is that the <code>wait</code> call
+is avoided entirely if <code>a</code> was already set to one before the <code>while</code> loop.
+In a similar fashion, if the main thread had also stored in the atomic variable
+whether it started waiting for the signal (by setting it to a value other than zero or one),
+the signaling thread could skip the futex wake operation if the main thread hadn’t started waiting yet.
+This is what makes futex-based synchronization primitives so fast:
+since we manage the state ourselves, we don’t need to rely on the kernel,
+except when we actually need to block.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>Since Rust 1.48, the standard library’s thread parking functions on Linux
+are implemented like this.
+They use one atomic variable per thread, with three possible states:
+zero for the idle and initial state, one for "unparked but not yet parked," and minus one for "parked but not yet unparked."</p></div></div><p>In <a href="building-locks.html">Chapter 9</a>, we’ll implement mutexes, condition variables, and reader-writer locks using these operations.</p></section><section id="futex-ops"><h3><a href="#futex-ops">Futex Operations</a></h3><p><a class="indexterm" id="index-futex-operationsLinux"></a>
+Next to the wait and wake operations, the futex syscall supports several other operations.
+In this section, we’ll briefly discuss every operation supported by this syscall.</p><p><a class="indexterm" id="index-Linux-futexsyscall-arguments"></a> <a class="indexterm" id="index-SYSfutexLinux-arguments"></a>
+The first argument to the futex is always a pointer to the 32-bit atomic variable to operate on.
+The second argument is a constant representing the operation, such as <code>FUTEX_<wbr>WAIT</code>,
+to which up to two flags can be added: <code>FUTEX_<wbr>PRIVATE_<wbr>FLAG</code> and/or <code>FUTEX_<wbr>CLOCK_<wbr>REALTIME</code>,
+which we will discuss below.
+The remaining arguments depend on the operation and are described for each of the operations below.</p><dl><dt><code>FUTEX_<wbr>WAIT</code></dt><dd><p><a class="indexterm" id="index-futex-operationsLinux-FUTEXWAIT"></a>
+This operation takes two additional arguments: the value the atomic variable is expected to have and a pointer to a <code>timespec</code> representing the maximum time <span>to wait</span>.</p><p><a class="indexterm" id="index-timeout-futex"></a> <a class="indexterm" id="index-futex-timeout"></a>
+If the value of the atomic variable matches the expected value,
+the wait operation blocks until woken up by one of the wake operations,
+or until the duration specified by the <code>timespec</code> has passed.
+If the pointer to the <code>timespec</code> is null, there is no time limit.
+Additionally, the wait operation might spuriously wake up
+and return without a corresponding wake operation, before the time limit is reached.</p><p>The check and blocking operation happens as a single atomic operation with respect
+to other futex operations, meaning that no wake signals can get lost between them.</p><p>The duration specified by the <code>timespec</code> represents a duration on the monotonic clock
+(like Rust’s <code>Instant</code>) by default.
+<a class="indexterm" id="index-futex-operationsLinux-FUTEXCLOCKREALTIME"></a>
+By adding the <code>FUTEX_<wbr>CLOCK_<wbr>REALTIME</code> flag, the real-time clock (like Rust’s <code>SystemTime</code>)
+is used instead.</p><p>The return value indicates whether the expected value matched and whether the timeout was reached or not.</p></dd><dt><code>FUTEX_<wbr>WAKE</code></dt><dd><p><a class="indexterm" id="index-futex-operationsLinux-FUTEXWAKE"></a>
+This operation takes one additional argument: the number of threads to wake up, as an <code>i32</code>.</p><p>This wakes up as many threads as specified that are blocked in a wait
+operation on the same atomic variable.
+(Or fewer if there are not that many waiting threads.)
+Most commonly, this argument is either one to wake up just one thread,
+or <code>i32::<wbr>MAX</code> to wake up all threads.</p><p>The number of awoken threads is returned.</p></dd><dt><code>FUTEX_<wbr>WAIT_<wbr>BITSET</code></dt><dd><p><a class="indexterm" id="index-futex-operationsLinux-FUTEXWAITBITSET"></a>
+This operation takes four additional arguments:
+the value the atomic variable is expected to have,
+a pointer to a <code>timespec</code> representing the maximum time to wait,
+a pointer that’s ignored, and a 32-bit "bitset" (a <code>u32</code>).</p><p>This operation behaves the same as <code>FUTEX_<wbr>WAIT</code>, with two differences.</p><p>The first difference is that it takes a <code>bitset</code> argument that can be used to wait
+for only specific wake operations, rather than all wake operations on the same atomic variable.
+A <code>FUTEX_<wbr>WAKE</code> operation is never ignored,
+but a signal from a <code>FUTEX_<wbr>WAKE_<wbr>BITSET</code> operation is ignored if the
+wait bitset and the wake bitset do not have any 1-bit in common.</p><p>For example, a <code>FUTEX_<wbr>WAKE_<wbr>BITSET</code> operation with a bitset of <code>0b0101</code> will
+wake up a <code>FUTEX_<wbr>WAIT_<wbr>BITSET</code> operation with a bitset of <code>0b1100</code>, but not one
+with a bitset of <code>0b0010</code>.</p><p>This might be useful when implementing something like a reader-writer lock,
+to wake up a writer without waking up any readers.
+However, note that using two separate atomic variables can be more efficient
+than using a single one for two different kinds of waiters,
+since the kernel will keep a single list of waiters per atomic variable.</p><p>The other difference with <code>FUTEX_<wbr>WAIT</code> is that the <code>timespec</code> is
+used as an absolute timestamp, rather than a duration.
+Because of this, <code>FUTEX_<wbr>WAIT_<wbr>BITSET</code> is often used with a bitset of <code>u32::<wbr>MAX</code> (all bits set),
+effectively turning it into a regular <code>FUTEX_<wbr>WAIT</code> operation,
+but with an absolute timestamp for the time limit.</p></dd><dt><code>FUTEX_<wbr>WAKE_<wbr>BITSET</code></dt><dd><p><a class="indexterm" id="index-futex-operationsLinux-FUTEXWAKEBITSET"></a>
+This operation takes four additional arguments:
+the number of threads to wake up,
+two pointers that are ignored,
+and a 32-bit "bitset" (a <code>u32</code>).</p><p>This operation is identical to <code>FUTEX_<wbr>WAKE</code>,
+except it does not wake up <code>FUTEX_<wbr>WAIT_<wbr>BITSET</code> operations
+with a bitset that does not overlap. (See <code>FUTEX_<wbr>WAIT_<wbr>BITSET</code> above.)</p><p>With a bitset of <code>u32::<wbr>MAX</code> (all bits set), this is identical to <code>FUTEX_<wbr>WAKE</code>.</p></dd><dt><code>FUTEX_<wbr>REQUEUE</code></dt><dd><p><a class="indexterm" id="index-futex-operationsLinux-FUTEXREQUEUE"></a>
+This operation takes three additional arguments:
+the number of threads to wake up (an <code>i32</code>),
+the number of threads to requeue (an <code>i32</code>),
+and the address of a secondary atomic variable.</p><p><a class="indexterm" id="index-requeuingwaitingthreads"></a> <a class="indexterm" id="index-futex-requeuing"></a>
+This operation wakes up a given number of waiting threads,
+and then <em>requeues</em> a given number of remaining waiting threads
+to instead wait on another atomic variable.</p><p>Waiting threads that are requeued continue to wait,
+but are no longer affected by wake operations on the primary atomic variable.
+Instead, they are now woken up by wake operations on the secondary atomic variable.</p><p>This can be useful for implementing something like the "notify all" operation of a condition variable.
+Instead of waking up all threads, which will subsequently try to lock a mutex,
+most likely making all but one thread wait for that mutex right afterwards,
+we could only wake up a single thread and requeue all the others to directly wait for the mutex without waking them up first.</p><p>Just like with the <code>FUTEX_<wbr>WAKE</code> operation,
+the value of <code>i32::<wbr>MAX</code> can be used to requeue all waiting threads.
+(Specifying a value of <code>i32::<wbr>MAX</code> for the number of threads to wake up is not very useful,
+since that will make this operation equivalent to <code>FUTEX_<wbr>WAKE</code>.)</p><p>The number of awoken threads is returned.</p></dd></dl><dl><dt><code>FUTEX_<wbr>CMP_<wbr>REQUEUE</code></dt><dd><p><a class="indexterm" id="index-futex-operationsLinux-FUTEXCMPREQUEUE"></a>
+This operation takes four additional arguments:
+the number of threads to wake up (an <code>i32</code>),
+the number of threads to requeue (an <code>i32</code>),
+the address of a <span>secondary</span> atomic variable,
+and the value the primary atomic variable is expected to have.</p><p>This operation is nearly identical to <code>FUTEX_<wbr>REQUEUE</code>,
+except it refuses to operate if the value of the primary atomic variable
+does not match the expected value.
+The check of the value and the requeuing operation happens atomically
+with respect to other futex operations.</p><p>Unlike <code>FUTEX_<wbr>REQUEUE</code>, this returns the sum of the number of
+awoken and requeued threads.</p></dd><dt><code>FUTEX_<wbr>WAKE_<wbr>OP</code></dt><dd><p><a class="indexterm" id="index-futex-operationsLinux-FUTEXWAKEOP"></a>
+This operation takes four additional arguments:
+the number of threads to wake up on the primary atomic variable (an <code>i32</code>),
+the number of threads to potentially wake up on the second atomic variable (an <code>i32</code>),
+the address of a secondary atomic variable,
+and a 32-bit value encoding both an operation and a comparison to be made.</p><p>This is a very specialized operation that modifies the secondary atomic variable,
+wakes a number of threads waiting on the primary atomic variable,
+checks if the previous value of the atomic variable matches a given condition,
+and if so, also wakes a number of threads on a secondary atomic variable.</p><p>In other words, it is identical to the following code, except the entire
+operation behaves atomically with respect to other futex operations:</p><pre>let old = atomic2.fetch_update(Relaxed, Relaxed, some_operation);
+wake(atomic1, N);
+if some_condition(old) {
+    wake(atomic2, M);
+}</pre><p>The modifying operation to perform and the condition to check are both
+specified by the last argument to the syscall, encoded in its 32 bits.
+The operation can be one of the following: assignment, addition, binary <code>or</code>, binary <code>and-not</code>,
+and binary <code>xor</code>, with either a 12-bit argument or a 32-bit argument that’s a power of two.
+The comparison can be chosen from <code>==</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;​=</code>, <code>&gt;</code>, and <code>&gt;=</code>,
+with a 12-bit argument.</p><p>See the <code>futex(2)</code> Linux man page for details on the encoding of this argument,
+or use the <code>linux-futex</code> crate on crates.io,
+which includes a convenient way to construct this argument.</p><p>This operation returns the total number of awoken threads.</p><p>At first glance this may seem like a flexible operation with many use cases.
+However, it was designed for just one specific use case in GNU <code>libc</code> where two
+threads had to be woken up from two separate atomic variables.
+That specific case has been replaced by a different implementation that no longer makes use of <code>FUTEX_<wbr>WAKE_<wbr>OP</code>.</p></dd></dl><p><a class="indexterm" id="index-futex-operationsLinux-FUTEXPRIVATEFLAG"></a>
+The <code>FUTEX_<wbr>PRIVATE_<wbr>FLAG</code> can be added to any of these operations to enable a possible optimization if all relevant futex operations
+on the same atomic variable(s) come from threads of the same process,
+which is usually the case.
+To make use of it, every relevant futex operation must include this same flag.
+By allowing the kernel to assume there will be no interactions with other processes,
+it can skip some otherwise potentially expensive steps in performing futex operations,
+improving performance.</p><p><a class="indexterm" id="index-futex-onotherplatforms"></a>
+In addition to Linux, NetBSD also supports all the futex operations described above.
+<a class="indexterm" id="index-NetBSDfutexsupport"></a> <a class="indexterm" id="index-OpenBSDlimitedfutexsupport"></a>
+OpenBSD also has a futex syscall, but only supports the <code>FUTEX_<wbr>WAIT</code>, <code>FUTEX_<wbr>WAKE</code>, and <code>FUTEX_<wbr>REQUEUE</code> operations.
+<a class="indexterm" id="index-FreeBSDumtxopsyscall"></a>
+FreeBSD does not have a native futex syscall,
+but does include a syscall called <code>_<wbr>umtx_<wbr>op</code>, which includes functionality
+nearly identical to <code>FUTEX_<wbr>WAIT</code> and <code>FUTEX_<wbr>WAKE</code>:
+<code>UMTX_<wbr>OP_<wbr>WAIT</code> (for 64-bit atomics), <code>UMTX_<wbr>OP_<wbr>WAIT_<wbr>UINT</code> (for 32-bit atomics), and <code>UMTX_<wbr>OP_<wbr>WAKE</code>.
+Windows also includes functions that behave very similarly to the futex wait and wake operations,
+which we will discuss later in this chapter.</p><aside id="futex2"><h4><a href="#futex2">New Futex Operations</a></h4><p>As of Linux 5.16, released in 2022, there is an additional futex syscall: <code>futex_<wbr>waitv</code>.
+<a class="indexterm" id="index-futex-operationsLinux-futexwaitvsyscall"></a> <a class="indexterm" id="index-Linux-futexwaitvsyscall"></a>
+This new syscall allows waiting for more than one futex at once,
+by providing it a list of atomic variables (and their expected values) to wait on.
+A thread blocked on <code>futex_<wbr>waitv</code> can be woken up by a wake operation on
+any of the specified variables.</p><p>This new syscall also leaves space for future extensions.
+For example, it’s possible to specify the size of the atomic variable to wait on.
+While the initial implementation only supports 32-bit atomics,
+just like the original <code>futex</code> syscall,
+this might be extended in the future to include 8-bit, 16-bit, and 64-bit atomics.</p></aside></section><section id="priority-inheritance-futex-operations"><h3><a href="#priority-inheritance-futex-operations">Priority Inheritance Futex Operations</a></h3><p><a class="indexterm" id="index-priorityinversion"></a>
+Priority inversion is a problem that occurs when a high priority thread
+is blocked on a lock held by a low priority thread.
+<a class="indexterm" id="index-futex-operationsLinux-priorityinheritance"></a>
+The high priority thread effectively has its priority "inverted,"
+since it now has to wait for the low priority thread to release the lock before it can make progress.</p><p><a class="indexterm" id="index-priorityinheritance"></a>
+A solution to this problem is <em>priority inheritance</em>, in which the blocking thread
+inherits the priority of the highest priority thread that is waiting for it,
+temporarily increasing the priority of the low priority thread while it holds the lock.</p><p>In addition to the seven futex operations we discussed before,
+there are six priority inheriting futex operations
+specifically designed for implementing <em>priority inheriting</em> locks.</p><p>The general futex operations we discussed before
+do not have any requirements for the exact contents of the atomic variable.
+We got to choose ourselves what the 32 bits represent.
+However, for a priority inheriting mutex, the kernel needs to be able
+to understand whether the mutex is locked, and if so, which thread has locked it.</p><p>To avoid having to make a syscall on every state change,
+the priority inheritance futex operations specify the exact contents
+of the 32-bit atomic variable, so the kernel can understand it:
+the highest bit represents whether there are any threads waiting to lock the mutex,
+and the lowest 30 bits contain the thread ID (the Linux <code>tid</code>, not the Rust <code>ThreadId</code>)
+of the thread that holds the lock, or zero when unlocked.</p><p>As an extra feature, the kernel will set the second highest bit if the thread that holds the lock
+terminates without unlocking it, but only if there are any waiters.
+<a class="indexterm" id="index-mutexes-robust"></a> <a class="indexterm" id="index-robustmutexes"></a>
+This allows for the mutex to be <em>robust</em>:
+a term used to describe a mutex that can gracefully handle a situation where its "owning"
+thread unexpectedly terminates.</p><p>The priority inheriting futex operations have a one to one
+correspondence to the standard mutex operations:
+<code>FUTEX_<wbr>LOCK_<wbr>PI</code> for locking, <code>FUTEX_<wbr>UNLOCK_<wbr>PI</code> for unlocking,
+and <code>FUTEX_<wbr>TRYLOCK_<wbr>PI</code> for locking without blocking.
+Additionally, the <code>FUTEX_<wbr>CMP_<wbr>REQUEUE_<wbr>PI</code> and <code>FUTEX_<wbr>WAIT_<wbr>REQUEUE_<wbr>PI</code> operations
+can be used to implement a condition variable that pairs with a priority inheriting mutex.</p><p>We’ll not discuss these operations in detail.
+See the <code>futex(2)</code> Linux man page or the <code>linux-futex</code> crate on crates.io for their details.
+  </p></section></section><section id="macos"><h2><a href="#macos">macOS</a></h2><p><a class="indexterm" id="index-macOS-interfacingwiththekernel-2"></a>
+The kernel that’s part of macOS supports various useful low-level concurrency related syscalls.
+However, just like most operating systems, the kernel interface is not considered stable,
+and we’re not supposed to use it directly.</p><p>The only way software should interact with the macOS kernel is through the libraries
+that ship with the system.
+These libraries include its standard library implementations for
+C (libc), C++ (libc++), Objective-C, and Swift.</p><p>As a POSIX-compliant Unix system, the macOS C library includes a full pthread implementation.
+The standard locks in other languages tend to use pthread’s primitives under the hood.</p><p>Pthread’s locks tend to be relatively slow on macOS
+compared to the equivalent on other operating systems.
+<a class="indexterm" id="index-fairlocks"></a> <a class="indexterm" id="index-mutexes-fair"></a>
+One of the reasons is that the locks on macOS behave as <em>fair locks</em> by default.
+This means that when several threads attempt to lock the same mutex,
+they are served in order of arrival, like a perfect queue.
+While fairness can be a desirable property, it can significantly
+reduce performance, especially under high contention.</p><section id="os-unfair-lock"><h3><a href="#os-unfair-lock">os_unfair_lock</a></h3><p><a class="indexterm" id="index-mutexes-osunfairlockmacOS"></a> <a class="indexterm" id="index-osunfairlockmacOS"></a> <a class="indexterm" id="index-macOS-osunfairlock"></a>
+Next to the pthread primitives, macOS 10.12 introduced a new lightweight platform-specific mutex,
+which is not fair: <code>os_<wbr>unfair_<wbr>lock</code>.
+It is just 32 bits in size, initialized statically with the <code>OS_<wbr>UNFAIR_<wbr>LOCK_<wbr>INIT</code> constant,
+and does not require destruction.
+It can be locked through <code>os_<wbr>unfair_<wbr>lock_<wbr>lock()</code> (blocking)
+or <code>os_<wbr>unfair_<wbr>lock_<wbr>trylock()</code> (non-blocking), and is unlocked through <code>os_<wbr>unfair_<wbr>lock_<wbr>unlock()</code>.</p><p>Unfortunately, it does not come with a condition variable,
+nor does it have a reader-writer variant.</p></section></section><section id="windows"><h2><a href="#windows">Windows</a></h2><p><a class="indexterm" id="index-Windows"></a> <a class="indexterm" id="index-Windows-Win32API"></a> <a class="indexterm" id="index-Windows-NativeAPI"></a>
+The Windows operating system ships with a set of libraries that together form
+the <em>Windows API</em>, often called the "Win32 API" (even on 64-bit systems).
+This forms a layer on top of the "Native API":
+the largely undocumented interface with the kernel,
+which we’re not supposed to use directly.</p><p><a class="indexterm" id="index-windows-syscrate"></a> <a class="indexterm" id="index-windowscrate"></a>
+The Windows API is made available to Rust programs through Microsoft’s official
+<code>windows</code> and <code>windows-sys</code> crates, which are available on crates.io.</p><section id="heavyweight-kernel-objects"><h3><a href="#heavyweight-kernel-objects">Heavyweight Kernel Objects</a></h3><p><a class="indexterm" id="index-Windows-kernel-managedobjects"></a> <a class="indexterm" id="index-kernel-kernel-managedobjectsWindows"></a>
+Many of the older synchronization primitives available on Windows
+are managed fully by the kernel, making them quite heavyweight,
+and giving them similar properties as other kernel-managed objects, such as files.
+They can be used by multiple processes,
+they can be named and located by their name,
+and they support fine-grained permissions, similar to files.
+For example, it’s possible to allow a process to wait on some object,
+without allowing it to send signals through it to wake others.</p><p>These heavyweight kernel-managed synchronization objects include <code>Mutex</code> (which can be locked and unlocked),
+<code>Event</code> (which can be signalled and waited for), and <code>WaitableTimer</code> (which can be automatically signalled after a chosen time, or periodically).
+Creating such an object results in a <code>HANDLE</code>, just like opening a file,
+that can be easily passed around and used with the regular <code>HANDLE</code> functions;
+most notably the family of wait functions.
+These functions allow us to wait for one or more objects of various types,
+including the heavyweight synchronization primitives,
+processes, threads, and various forms of I/O.</p></section><section id="lighter-weight-objects"><h3><a href="#lighter-weight-objects">Lighter-Weight Objects</a></h3><p>A lighter-weight synchronization primitive included in the Windows API is the "critical section."</p><p><a class="indexterm" id="index-criticalsectionWindows"></a>
+The term <em>critical section</em> refers to a part of a program, a "section" of code,
+that may not be entered concurrently by more than one thread.
+The mechanism for protecting a critical section is often called a mutex.
+In this case, however, Microsoft used the name "critical section" for the mechanism,
+quite possibly because the name "mutex" was already taken by the heavyweight <code>Mutex</code> object
+discussed above.</p><p><a class="indexterm" id="index-Windows-criticalsection"></a> <a class="indexterm" id="index-recursivelocking-2"></a> <a class="indexterm" id="index-mutexes-recursive"></a>
+A Windows <code>CRITICAL_<wbr>SECTION</code> is effectively a <em>recursive mutex</em>,
+except it uses the terms "enter" and "leave" rather than "lock" and "unlock." As a recursive mutex, it is designed to only protect against other threads.
+It allows the same thread to lock (or "enter") it more than once,
+requiring it to also unlock (leave) it the same number <span>of times</span>.</p><p>This is something to keep in mind when wrapping this type in Rust.
+Successfully locking (entering) a <code>CRITICAL_<wbr>SECTION</code> shouldn’t result in
+an exclusive reference (<code>&amp;mut T</code>) to data protected by it.
+Otherwise, a thread could use this to create two exclusive references to the same data,
+which immediately results in undefined <span>behavior</span>.</p><p><a class="indexterm" id="index-movablenot-criticalsectionWindows"></a> <a class="indexterm" id="index-unmovable-criticalsectionWindows"></a>
+A <code>CRITICAL_<wbr>SECTION</code> is initialized using the <code>InitializeCriticalSection()</code> function,
+destroyed with <code>DeleteCriticalSection()</code>, and may not be moved.
+It is locked through <code>EnterCriticalSection()</code> or <code>TryEnterCriticalSection()</code>,
+and unlocked with <code>LeaveCriticalSection()</code>.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>Until Rust 1.51, <code>std::<wbr>sync::<wbr>Mutex</code> on Windows XP was based on a (<code>Box</code>-allocated) <code>CRITICAL_<wbr>SECTION</code> object. (Rust 1.51 dropped support for Windows XP.)</p></div></div><section id="windows-srw"><h4><a href="#windows-srw">Slim reader-writer locks</a></h4><p><a class="indexterm" id="index-reader-writerlocks-SRWlocksWindows"></a> <a class="indexterm" id="index-slimreader-writerlocksWindows"></a> <a class="indexterm" id="index-SRWlocksWindows"></a> <a class="indexterm" id="index-Windows-SRWlocks"></a>
+As of Windows Vista (and Windows Server 2008),
+the Windows API includes a much nicer locking primitive that’s very lightweight:
+the <em>slim reader-writer lock</em>, or <em>SRW lock</em> for short.</p><p>The <code>SRWLOCK</code> type is just one pointer in size, can be statically initialized with <code>SRWLOCK_<wbr>INIT</code>,
+and does not require destruction.
+While not in use (borrowed), we’re even allowed to move it, making it an excellent candidate
+for being wrapped in a <span>Rust type</span>.</p><p>It provides exclusive (writer) locking and unlocking through <code>AcquireSRWLockExclusive()</code>,
+<code>TryAcquireSRWLockExclusive()</code>, and <code>ReleaseSRWLockExclusive()</code>,
+and provides shared (reader) locking and unlocking through <code>AcquireSRWLockShared()</code>,
+<code>TryAcquireSRWLockShared()</code>, and <code>ReleaseSRWLockShared()</code>.
+It is often used as a regular mutex, simply by ignoring the shared (reader) locking functions.</p><p>An SRW lock prioritizes neither writers nor readers.
+While not guaranteed, it attempts to serve all lock requests in order,
+as far as possible without reducing performance.
+One must not attempt to acquire a second shared (reader) lock on a thread that already holds one.
+Doing so could lead to a permanent deadlock if the operation gets queued behind an exclusive (writer) lock operation of another thread,
+which would be blocked because of the first shared (reader) lock that the first thread already holds.</p><p><a class="indexterm" id="index-conditionvariables-Windows"></a> <a class="indexterm" id="index-Windows-conditionvariables"></a>
+The SRW lock was introduced to the Windows API together with the condition variable.
+Similar to an SRW lock, a <code>CONDITION_<wbr>VARIABLE</code> is just one pointer in size,
+can be initialized statically with <code>CONDITION_<wbr>VARIABLE_<wbr>INIT</code>,
+and does not require destruction.
+We’re also allowed to move it, as long as it isn’t in use (borrowed).</p><p>This condition variable can not only be used together with
+an SRW lock, through <code>SleepConditionVariableSRW</code>,
+but also with a critical section, through <code>SleepConditionVariableCS</code>.</p><p>Waking up waiting threads is done either through <code>WakeConditionVariable</code>
+to wake a single thread, or <code>WakeAllConditionVariable</code> to wake all waiting threads.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>Originally, Windows SRW locks and condition variables used in the standard library
+were wrapped in a <code>Box</code> to avoid moving the objects.
+Microsoft didn’t document the movability guarantees until we requested that in 2020.
+Since then, as of Rust 1.49, <code>std::<wbr>sync::<wbr>Mutex</code>, <code>std::<wbr>sync::<wbr>RwLock</code>, and <code>std::<wbr>sync::<wbr>Condvar</code> on
+Windows Vista and later directly wrap an <code>SRWLOCK</code> or <code>CONDITION_<wbr>VARIABLE</code>, without any allocations.</p></div></div></section></section><section id="address-based-waiting"><h3><a href="#address-based-waiting">Address-Based Waiting</a></h3><p><a class="indexterm" id="index-address-basedwaitingWindows"></a>
+Windows 8 (and Windows Server 2012) introduced a new, more flexible, type of synchronization functionality
+that is very similar to the Linux <code>FUTEX_<wbr>WAIT</code> and <code>FUTEX_<wbr>WAKE</code> operations we discussed earlier in this chapter.</p><p><a class="indexterm" id="index-Windows-WaitOnAddress"></a> <a class="indexterm" id="index-WaitOnAddressWindows"></a>
+The <code>WaitOnAddress</code> function can operate on an 8-bit, 16-bit, 32-bit, or 64-bit atomic variable.
+It takes four arguments: the address of the atomic variable,
+the address of a variable that holds the expected value,
+the size of the atomic variable (in bytes),
+and the maximum number of milliseconds to wait before giving up (or <code>u32::<wbr>MAX</code> for an infinite timeout).</p><p>Just like the <code>FUTEX_<wbr>WAIT</code> operation, it compares the value of the atomic variable
+with the expected value, and goes to sleep if they match, waiting for a corresponding wake operation.
+The check and sleep operation happens atomically with respect to wake operations,
+meaning no wake signal can get lost in between.</p><p><a class="indexterm" id="index-WakeByAddressSingleWindows"></a> <a class="indexterm" id="index-WakeByAddressAllWindows"></a> <a class="indexterm" id="index-Windows-WakeByAddressSingle"></a> <a class="indexterm" id="index-Windows-WakeByAddressAll"></a>
+Waking a thread that’s waiting on <code>WaitOnAddress</code> is done through
+either <code>WakeByAddressSingle</code> to wake a single thread, or <code>WakeByAddressAll</code> to wake all waiting threads.
+These two functions take just a single argument:
+the address of the atomic variable, which was also passed to <code>WaitOnAddress</code>.</p><p>Some, but not all, of the synchronization primitives of the Windows API are implemented using these functions.
+More importantly, they are a great building block for building our own primitives, which we will do in <a href="building-locks.html">Chapter 9</a>.
+</p></section></section><section id="summary"><h2><a href="#summary">Summary</a></h2><ul><li><p>A <em>syscall</em> is a call into the operating system’s kernel and is relatively slow
+compared to a regular function call.</p></li><li><p>Usually, programs don’t make syscalls directly, but instead go through the operating system’s libraries
+(e.g., <code>libc</code>) to interface with the kernel.
+On many operating systems, this is the only supported way of interfacing with the kernel.</p></li><li><p>The <code>libc</code> crate gives Rust code access to <code>libc</code>.</p></li><li><p>On POSIX systems, <code>libc</code> includes more than what’s required by the C standard to comply with the POSIX standard.</p></li><li><p>The POSIX standard includes <em>pthreads</em>, a library with concurrency primitives such as <code>pthread_<wbr>mutex_<wbr>t</code>.</p></li><li><p>Pthread types are designed for C, not for Rust.
+For example, they are not movable, which can be a problem.</p></li><li><p>Linux has a <em>futex</em> syscall supporting several waiting and waking operations on an <code>AtomicU32</code>.
+The wait operation verifies the expected value of the atomic, which is used to avoid missing notifications.</p></li><li><p>In addition to pthreads, macOS also provides <code>os_<wbr>unfair_<wbr>lock</code> as a lightweight locking primitive.</p></li><li><p>Windows heavyweight concurrency primitives always require interacting with the kernel,
+but can be passed between processes and used with the standard Windows waiting functions.</p></li><li><p>Windows lightweight concurrency primitives include a "slim" reader-writer lock (<em>SRW lock</em>)
+and a condition variable. These are easily wrapped in Rust, as they <span>are movable</span>.</p></li><li><p>Windows also provides basic futex-like functionality, through <code>WaitOnAddress</code> and <code>WakeByAddress</code>.</p></li></ul></section></article><nav class="next"><a href="building-locks.html">Next: Chapter 9. Building Our Own Locks</a></nav></div>
+<footer>
+<p><a href=".">Rust Atomics and Locks</a><br>&copy; 2023 ♥ Mara Bos</p>
+<p><a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/"><img alt="Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License" src="https://i.creativecommons.org/l/by-nc-nd/4.0/88x31.png"></a></p>
+<p class="report-issue"><a href="https://github.com/m-ou-se/rust-atomics-and-locks/issues/">Report an issue</a></p>
+</footer>
+</body>
+</html>

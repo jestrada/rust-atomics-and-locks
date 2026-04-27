@@ -1,0 +1,1027 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust Atomics and Locks — Chapter 7. Understanding the Processor</title>
+<meta name="author" content="Mara Bos">
+<meta name="theme-color" content="#FF69B4">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="site">
+<nav class="index">
+<a href=".">Rust Atomics and Locks</a>
+</nav>
+<article id="hardware"><h1><a href="">Chapter 7. Understanding the Processor</a></h1><p>While the theory from Chapters <a href="atomics.html">2</a> and <a href="memory-ordering.html">3</a>
+is all we need to write correct concurrent code,
+it can additionally be very useful to develop an approximate understanding of
+what goes on in practice at the processor level.
+In this chapter, we’ll explore the machine instructions that
+atomic operations compile down to, how different processor architectures differ,
+why a weak version of <code>compare_<wbr>exchange</code> exists,
+what memory ordering means at the lowest level of individual instructions,
+and how caching relates to it all.</p><p>The goal of this chapter is not to understand every relevant detail of every
+single processor architecture.
+That would take many bookshelves full of books,
+many of which have probably not been written or are not publicly available.
+Instead, the goal of this chapter is to develop a general idea of how
+atomics work at the processor level,
+to be able to make more informed decisions when implementing and optimizing
+code involving atomics.
+And, of course, to simply satisfy our curiosity about what goes on behind the scenes—taking a break from all the abstract theory.</p><p>To make things as concrete as possible,
+we’ll focus on two specific processor <span>architectures</span>:
+<a class="indexterm" id="index-processorarchitecture"></a></p><dl><dt>x86-64: </dt><dd><p><a class="indexterm" id="index-x86-64processorarchitecture"></a> <a class="indexterm" id="index-Intelprocessors"></a> <a class="indexterm" id="index-AMDprocessors"></a>
+The 64-bit version of the x86 architecture implemented by Intel and AMD processors
+used in the majority of laptops, desktops, servers, and some game consoles.
+While the originally 16-bit x86 architecture and its very popular 32-bit extension
+were developed by Intel, the 64-bit version that we now call x86-64
+was initially an extension developed by AMD, often referred to as AMD64.
+Intel also developed its own 64-bit architecture, IA-64,
+but ended up adopting AMD’s more popular x86 extension instead
+(under the names IA-32e, EM64T, and later <span>Intel 64</span>).</p></dd><dt>ARM64: </dt><dd><p>  <a class="indexterm" id="index-ARM64processorarchitecture"></a>
+The 64-bit version of the ARM architecture used by nearly all modern mobile devices,
+high performance embedded systems,
+and also increasingly in recent laptops and desktops.
+It is also known as AArch64 and was introduced as part of ARMv8.
+Earlier (32-bit) versions of ARM, which are similar in many ways, are used
+in an even wider variety of applications.
+Many popular microcontrollers in every kind of embedded system imaginable,
+from cars to electronic COVID tests, are based on ARMv6 and ARMv7.</p></dd></dl><p>These two architectures are unalike in many ways.
+Most importantly, they take different approaches to atomics.
+Understanding how atomics work on both of them provides us with a
+more general understanding that is transferable to many other architectures.</p><section id="instructions"><h2><a href="#instructions">Processor Instructions</a></h2><p>We can develop an approximate understanding of how things work at the processor level by
+taking a close look at the output of the compiler, the exact instructions that the processor will execute.
+  <a class="indexterm" id="index-instructions"></a></p><aside id="asm-introduction"><h3><a href="#asm-introduction">Brief Introduction to Assembly</a></h3><p>When compiling software written in any compiled language like Rust or C,
+your code gets translated into <em>machine instructions</em> that can be executed by the
+processor that will eventually run your program.
+These instructions are highly specific to the processor architecture
+you’re compiling your program for.</p><p><a class="indexterm" id="index-machinecode"></a>
+These instructions, also called <em>machine code</em>, are encoded in binary form,
+which is quite unreadable to us humans.
+<a class="indexterm" id="index-assembly"></a> <em>Assembly</em> is the human-readable representation of these instructions.
+Every instruction is represented by one line of text,
+usually starting with a single word or acronym to identify the instruction,
+followed by its arguments or operands.
+<a class="indexterm" id="index-assembler"></a> <a class="indexterm" id="index-disassembler"></a>
+An <em>assembler</em> converts the text representation to binary representation,
+and a <em>disassembler</em> does the opposite.</p><p>After compiling from a language like Rust, most of the structure of the original source code is gone.
+Depending on optimization level, functions and function calls might still be recognizable.
+However, types such as structs or enums have been reduced to bytes and addresses,
+and loops and conditionals have been reduced to a flat structure with basic jump or branch instructions.</p><p>Here’s an example of what a snippet of assembly for a small part of a program might look like,
+for some made-up architecture:</p><pre>ldr x, 1234 // load from memory address 1234 into x
+li y, 0     // set y to zero
+inc x       // increment x
+add y, x    // add x to y
+mul x, 3    // multiply x by 3
+cmp y, 10   // compare y to 10
+jne -5      // jump five instructions back if not equal
+str 1234, x // store x to memory address 1234</pre><p><a class="indexterm" id="index-registers"></a> <a class="indexterm" id="index-processorregisters"></a>
+In this example, <code>x</code> and <code>y</code> are names of <em>registers</em>.
+Registers are part of the processor, not of the main memory,
+and usually hold a single integer or memory address.
+On 64-bit architectures, they are generally 64 bits in size.
+The number of registers varies per architecture,
+but is usually very limited.
+Registers are basically used as a temporary scratchpad in calculations, a place to keep intermediary results before storing things back to memory.</p><p><a class="indexterm" id="index-labelassembly"></a>
+Constants that refer to specific memory addresses,
+such as <code>1234</code> and <code>-5</code> in the example above,
+are often replaced with more human-readable <em>labels</em>.
+The assembler will automatically replace them with the actual address
+when converting assembly to binary machine code.</p><p>Using labels, the previous example might look like this instead:</p><pre>         ldr x, SOME_VAR
+         li y, 0
+my_loop: inc x
+         add y, x
+         mul x, 3
+         cmp y, 10
+         jne my_loop
+         str SOME_VAR, x</pre><p>Since the names of the labels are only part of the assembly, but not of the binary machine code,
+a disassembler will not know what labels were originally used and will most likely just use meaningless generated names like <code>label1</code> and <code>var2</code>.</p><p>A full course on assembly for all the different architectures falls outside the scope of this book,
+but is not a prerequisite for reading this chapter.
+A very general understanding is more than enough to understand the examples,
+as we’ll only be reading assembly, not writing it.
+The relevant instructions in each example will be explained in enough detail to
+be able to follow along with no prior experience with assembly.</p></aside><p><a class="indexterm" id="index-assembly-inspectingcompileroutput"></a>
+To look at the exact machine code that the Rust compiler produces, we have several options.
+We could compile our code as usual, and then use a disassembler (such as <code>objdump</code>)
+to turn the produced binary file back into assembly.
+<a class="indexterm" id="index-disassembler-2"></a>
+Using the debug information the compiler produces as part of the compilation process,
+the disassembler can produce labels that correspond to the original function names
+of the Rust source code.
+A downside of this method is that you need a disassembler that supports the specific
+processor architecture you’re compiling for.
+While the Rust compiler supports many architectures, many disassemblers
+only support the one architecture that they were compiled for.</p><p><a class="indexterm" id="index---emitasmrustc"></a>
+A more direct option is to ask the compiler to produce assembly instead of a binary by using the <code>--emit=asm</code> flag to <code>rustc</code>.
+A downside of this method is that the produced output contains a lot of irrelevant lines,
+containing information for the assembler and debug tools that we don’t need.</p><p><a class="indexterm" id="index-cargo-show-asm"></a>
+There are great tools such as <a href="https://oreil.ly/ePDzj"><code>cargo-show-asm</code></a>
+that integrate with <code>cargo</code> and automate the process of compiling your crate with the right flags,
+finding the relevant assembly for the function you’re interested in,
+and highlighting the relevant lines containing the actual instructions.</p><p><a class="indexterm" id="index-Godbolt"></a> <a class="indexterm" id="index-CompilerExplorer"></a>
+For relatively small snippets, the easiest and most recommended way is to use a
+web service like the excellent <a href="https://godbolt.org/">Compiler Explorer by Matt Godbolt</a>.
+This website allows you to write code in a number of languages, including Rust,
+and directly see corresponding compiled assembly using the selected compiler version.
+It even uses coloring to show which lines of Rust correspond to which
+lines of assembly, as far as such a correspondence still exists after optimization.</p><p>Since we want to look at the assembly for different architectures,
+we’ll need to specify an exact target for the Rust compiler to compile to.
+We’ll use <code>x86_<wbr>64-unknown-linux-musl</code> for x86-64 and <code>aarch64-unknown-linux-musl</code> for ARM64.
+These are already supported directly in Compiler Explorer.
+<a class="indexterm" id="index-x86-64processorarchitecture-x8664-unknown-linux-musltarget"></a> <a class="indexterm" id="index-ARM64processorarchitecture-aarch64-unknown-linux-musltarget"></a>
+If you’re compiling locally, for example using <code>cargo-show-asm</code> or the other methods mentioned above,
+you’ll need to make sure you’ve installed the Rust standard library for these targets,
+which is usually done using <code>rustup target add</code>.
+<a class="indexterm" id="index-rustup"></a></p><p>In all cases, the target to compile for is selected using the <code>--target</code> compiler flag.
+<a class="indexterm" id="index---targetrustc"></a>
+For example, <code>--target=aarch64-unknown-linux-musl</code>.
+If you don’t specify any target, it’ll automatically pick the platform you’re currently on.
+(Or, in the case of Compiler Explorer, the platform that it is hosted on,
+which is currently <code>x86_<wbr>64-unknown-linux-gnu</code>.)</p><p> <a class="indexterm" id="index-compileroptimization-enabling"></a> <a class="indexterm" id="index---releaseflagcargo"></a> <a class="indexterm" id="index--Oflagrustc"></a>
+In addition, it’s advisable to enable the <code>-O</code> flag to enable optimization
+(or <code>--release</code> when using Cargo),
+as that will enable optimization and disable overflow checking,
+which can significantly reduce the amount of produced
+assembly for the small functions we’ll be looking at.</p><p>To try it out, let’s look at the assembly for x86-64 and ARM64 for the following function:</p><pre>pub fn add_ten(num: &amp;mut i32) {
+    *num += 10;
+}</pre><p>Using <code>-O --target=aarch64-unknown-linux-musl</code> as the compiler flags with any of
+the methods described above, we’ll get something like the following assembly output for ARM64:</p><pre>add_ten:
+    ldr w8, [x0]
+    add w8, w8, #10
+    str w8, [x0]
+    ret</pre><p>The <code>x0</code> register contains the argument to our function, <code>num</code>, the address of the <code>i32</code> to increment by ten.
+<a class="indexterm" id="index-ARM64instructions-ldrloadregister"></a> <a class="indexterm" id="index-ldrloadregisterinstructionARM"></a>
+First, the <code>ldr</code> instruction loads the 32-bit value from that memory address into the <code>w8</code> register.
+<a class="indexterm" id="index-ARM64instructions-add"></a> <a class="indexterm" id="index-addinstructionARM"></a>
+Then, the <code>add</code> instruction adds ten to <code>w8</code> and stores the result back into <code>w8</code>.
+<a class="indexterm" id="index-ARM64instructions-strstoreregister"></a> <a class="indexterm" id="index-strstoreregisterinstructionARM"></a>
+And afterwards, the <code>str</code> instruction stores the <code>w8</code> register back into the same memory address.
+<a class="indexterm" id="index-ARM64instructions-retreturn"></a> <a class="indexterm" id="index-retreturninstructionARM"></a>
+Finally, the <code>ret</code> instruction marks the end of the function and causes the processor to jump back and continue with the function that called <code>add_<wbr>ten</code>.</p><p>If we compile the exact same code for <code>x86_<wbr>64-unknown-linux-musl</code>, we’ll get something like this instead:</p><pre>add_ten:
+    add dword ptr [rdi], 10
+    ret</pre><p><a class="indexterm" id="index-x86-64instructions-add"></a> <a class="indexterm" id="index-addinstructionx86"></a> <a class="indexterm" id="index-x86-64instructions-retreturn"></a> <a class="indexterm" id="index-retreturninstructionx86"></a>
+This time, a register called <code>rdi</code> is used for the <code>num</code> argument.
+More interestingly, on x86-64, a single <code>add</code> instruction can do what takes three instructions on ARM64:
+loading, incrementing, and storing a value.</p><p><a class="indexterm" id="index-complexinstructionsetcomputerCISC"></a>
+This is usually the case on a <em>complex instruction set computer</em> (CISC) architecture, such as x86.
+Instructions on such an architecture often have many variants,
+for example to operate on a register or to directly operate on memory of certain size.
+<a class="indexterm" id="index-dword"></a>
+(The <code>dword</code> in the assembly specifies a 32-bit operation.)</p><p><a class="indexterm" id="index-reducedinstructionsetcomputerRISC"></a>
+In contrast, a <em>reduced instruction set computer</em> (RISC) architecture, like ARM,
+usually has a simpler set of instructions with very few variants.
+Most instructions can only operate on registers,
+and loading and storing to memory takes a separate instruction.
+This allows for a simpler processor, which can result in a reduction in cost or
+sometimes higher performance.</p><p>This difference is especially relevant for atomic fetch-and-modify instructions,
+as we’ll see momentarily.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>While compilers are generally pretty smart, they don’t always generate the most optimal assembly,
+especially when atomic operations are involved.
+If you’re experimenting and find cases where you feel confused by a seemingly needless complexity in the assembly,
+that often just means there’s more optimization opportunities for a future version of the compiler.</p></div></div><section id="load-store-ops"><h3><a href="#load-store-ops">Load and Store</a></h3><p><a class="indexterm" id="index-loadandstoreoperationsatomic-onARM64andx86-64"></a> <a class="indexterm" id="index-instructions-loadandstoreoperations"></a>
+Before we dive into anything more advanced,
+let’s first look at the instructions used for the most basic atomic operations: load and store.</p><p>A regular non-atomic store through a <code>&amp;mut i32</code> takes just a single instruction
+on both x86-64 and ARM64, as shown below:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled x86-64</th><th>Compiled ARM64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;mut i32) {
+    *x = 0;
+}</pre></td><td><pre>a:
+    mov dword ptr [rdi], 0
+    ret</pre></td><td><pre>a:
+    str wzr, [x0]
+    ret</pre></td></tr></tbody></table></figure><p><a class="indexterm" id="index-x86-64instructions-movmove"></a> <a class="indexterm" id="index-movmoveinstructionx86"></a>
+On x86-64, the very versatile <code>mov</code> instruction is used to copy ("move") data
+from one place to another; in this case, from a zero constant to memory.
+On ARM64, the <code>str</code> (store register) instruction is used to store a 32-bit register into memory.
+In this case, the special <code>wzr</code> register is used, which always contains zero.</p><p>If we change the code to instead
+use a relaxed atomic store to an <code>AtomicI32</code>, we get:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled x86-64</th><th>Compiled ARM64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.store(0, Relaxed);
+}</pre></td><td><pre>a:
+    mov dword ptr [rdi], 0
+    ret</pre></td><td><pre>a:
+    str wzr, [x0]
+    ret</pre></td></tr></tbody></table></figure><p><a class="indexterm" id="index-atomic-loadandstoreoperations-comparedtonon-atomicoperations-2"></a> <a class="indexterm" id="index-loadandstoreoperationsatomic-comparedtonon-atomicoperations-2"></a>
+Perhaps somewhat surprisingly, the assembly is identical to the non-atomic version.
+As it turns out, the <code>mov</code> and <code>str</code> instructions were already atomic.
+They either happened, or they didn’t happen at all.
+Apparently, any difference between <code>&amp;mut i32</code> and <code>&amp;AtomicI32</code> here is only relevant
+for the compiler checks and optimizations,
+but is meaningless for the processor—at least for relaxed store operations on these two architectures.</p><p>The same thing happens when we look at relaxed load operations:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled x86-64</th><th>Compiled ARM64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;i32) -&gt; i32 {
+    *x
+}</pre></td><td><pre>a:
+    mov eax, dword ptr [rdi]
+    ret</pre></td><td><pre>a:
+    ldr w0, [x0]
+    ret</pre></td></tr><tr><td><pre>pub fn a(x: &amp;AtomicI32) -&gt; i32 {
+    x.load(Relaxed)
+}</pre></td><td><pre>a:
+    mov eax, dword ptr [rdi]
+    ret</pre></td><td><pre>a:
+    ldr w0, [x0]
+    ret</pre></td></tr></tbody></table></figure><p>On x86-64 the <code>mov</code> instruction is used again,
+this time to copy from memory into the 32-bit <code>eax</code> register.
+On ARM64, the <code>ldr</code> (load register) instruction is used to load the value from memory into the <code>w0</code> register.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p><a class="indexterm" id="index-registers-returnvalue"></a> <a class="indexterm" id="index-processorregisters-returnvalue"></a>
+The 32-bit <code>eax</code> and <code>w0</code> registers are used for passing back a 32-bit return value of a function.
+(For 64-bit values, the 64-bit <code>rax</code> and <code>x0</code> registers are used.)</p></div></div><p>While the processor apparently does not differentiate between atomic and non-atomic stores and loads,
+we cannot safely ignore the difference in our Rust code.
+If we use a <code>&amp;mut i32</code>, the Rust compiler may assume that no other thread can concurrently
+access the same <code>i32</code>, and might decide to transform or optimize the code in such a way
+that a store operation no longer results in a single corresponding store instruction.
+For example, it would be perfectly correct, although somewhat unusual,
+for a non-atomic 32-bit load or store to happen with two separate 16-bit instructions.
+ </p></section><section id="rmw-ops"><h3><a href="#rmw-ops">Read-Modify-Write Operations</a></h3><p><a class="indexterm" id="index-instructions-read-modify-writeoperations"></a>
+Things get far more interesting for <em>read-modify-write operations</em> such as addition.
+As discussed earlier in this chapter, a non-atomic read-modify-write operation
+usually compiles to three separate instructions (read, modify, and write) on a RISC architecture like ARM64,
+but can often be done in a single instruction on a CISC architecture like x86-64.
+This short example demonstrates that:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled x86-64</th><th>Compiled ARM64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;mut i32) {
+    *x += 10;
+}</pre></td><td><pre>a:
+    add dword ptr [rdi], 10
+    ret</pre></td><td><pre>a:
+    ldr w8, [x0]
+    add w8, w8, #10
+    str w8, [x0]
+    ret</pre></td></tr></tbody></table></figure><p>Before we even look at the corresponding atomic operation,
+we can reasonably assume that this time we will see a difference between the non-atomic and atomic versions.
+The ARM64 version here is clearly not atomic, as loading and storing happens in separate steps.</p><p>While not directly obvious from the assembly itself, the x86-64 version is not atomic.
+<a class="indexterm" id="index-microinstructions"></a>
+The <code>add</code> instruction will be split by the processor into several <em>microinstructions</em> behind the scenes,
+with separate steps for loading the value and storing the result.
+This would be irrelevant on a single-core computer, as switching a processor
+core between threads generally only happens between instructions.
+However, when <span>multiple</span> cores are executing instructions in parallel,
+we can no longer assume instructions all happen atomically without considering the
+multiple steps involved in executing a single instruction.</p><section id="lock-prefix"><h4><a href="#lock-prefix">x86 lock prefix</a></h4><p><a class="indexterm" id="index-fetch-and-modifyoperationsatomic-onx86-64"></a> <a class="indexterm" id="index-lockprefixx86"></a> <a class="indexterm" id="index-x86-64instructions-lockprefix"></a>
+To support multi-core systems, Intel introduced an instruction prefix called <code>lock</code>.
+It is used as a modifier to instructions like <code>add</code> to make their operation atomic.</p><p>The <code>lock</code> prefix originally caused the processor to temporarily block all other cores
+from accessing memory for the duration of the instruction.
+While this is a simple and effective way to make something appear as atomic
+to the other cores, it can be quite inefficient to stop the world for every atomic operation.
+Newer processors have a much more advanced implementation of the <code>lock</code> prefix,
+which doesn’t stop other cores from operating on unrelated memory,
+and allows cores to do useful things while waiting for a certain piece of memory to become available.</p><p>The <code>lock</code> prefix can only be applied to a very limited number of instructions,
+including <code>add</code>, <code>sub</code>, <code>and</code>, <code>not</code>, <code>or</code>, and <code>xor</code>, which are all very
+useful operations to be able to do atomically.
+<a class="indexterm" id="index-x86-64instructions-xchgexchange"></a> <a class="indexterm" id="index-xchgexchangeinstructionx86"></a>
+The <code>xchg</code> (exchange) instruction, which corresponds to the atomic swap operation,
+has an implicit lock prefix: it behaves like <code>lock xchg</code> regardless of the <code>lock</code> prefix.</p><p>Let’s see <code>lock add</code> in action by changing our last example to operate on an <span><code>AtomicI32</code></span>:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled x86-64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.fetch_add(10, Relaxed);
+}</pre></td><td><pre>a:
+    lock add dword ptr [rdi], 10
+    ret</pre></td></tr></tbody></table></figure><p>As expected, the only difference with the non-atomic version is the <code>lock</code> prefix.</p><p>In the example above, we ignore the return value from <code>fetch_<wbr>add</code>, the value of <code>x</code> before the operation.
+However, if we use that value, the <code>add</code> instruction no longer suffices.
+The <code>add</code> instruction can provide a little bit of useful information to next instructions,
+such as whether the updated value was zero or negative,
+but it does not provide the full (original or updated) value.
+Instead, another instruction can be used: <code>xadd</code> ("exchange and add"),
+which puts the originally loaded value into a register.
+<a class="indexterm" id="index-x86-64instructions-xaddexchangeandadd"></a> <a class="indexterm" id="index-xaddexchangeandaddinstructionx86"></a></p><p>We can see it in action by making a
+small modification to our code to return the value that <code>fetch_<wbr>add</code> returns:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled x86-64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;AtomicI32) -&gt; i32 {
+    x.fetch_add(10, Relaxed)
+}</pre></td><td><pre>a:
+    mov eax, 10
+    lock xadd dword ptr [rdi], eax
+    ret</pre></td></tr></tbody></table></figure><p>Instead of a constant 10, a register containing the value 10 is now used instead.
+The <code>xadd</code> instruction will reuse that register to store the old value.</p><p><a class="indexterm" id="index-x86-64instructions-subsubtract"></a> <a class="indexterm" id="index-subsubtractinstructionx86"></a>
+Unfortunately, other than <code>xadd</code> and <code>xchg</code>,
+none of the other lock-prefixable instructions, like <code>sub</code>, <code>and</code>, and <code>or</code>,
+have such a variant. For example, there is no <code>xsub</code> instruction.
+For subtraction that’s no issue, as <code>xadd</code> can be used with a negative value.
+For <code>and</code> and <code>or</code>, however, there’s no such alternative.</p><p><a class="indexterm" id="index-x86-64instructions-and"></a> <a class="indexterm" id="index-andinstructionx86"></a> <a class="indexterm" id="index-x86-64instructions-or"></a> <a class="indexterm" id="index-orinstructionx86"></a> <a class="indexterm" id="index-x86-64instructions-xor"></a> <a class="indexterm" id="index-xorinstructionx86"></a> <a class="indexterm" id="index-x86-64instructions-btsbittestandset"></a> <a class="indexterm" id="index-btsbittestandsetinstructionx86"></a> <a class="indexterm" id="index-x86-64instructions-btrbittestandreset"></a> <a class="indexterm" id="index-btrbittestandresetinstructionx86"></a> <a class="indexterm" id="index-x86-64instructions-btcbittestandcomplement"></a> <a class="indexterm" id="index-btcbittestandcomplementinstructionx86"></a>
+For <code>and</code>, <code>or</code>, and <code>xor</code> operations that affect only a single bit,
+such as <code>fetch_<wbr>or(1)</code> or <code>fetch_<wbr>and(!1)</code>, it’s possible to use
+the <code>bts</code> (bit test and set), <code>btr</code> (bit test and reset), and <code>btc</code> (bit test and complement) instructions.
+These instructions also allow a <code>lock</code> prefix, change only a single bit,
+and make the previous value of that one bit available for an instruction that follows,
+such as a conditional jump.</p><p>When these operations affect more than one bit, they cannot be represented by a single x86-64 instruction.
+Similarly, the <code>fetch_<wbr>max</code> and <code>fetch_<wbr>min</code> operations also have no corresponding x86-64 instruction.
+For these operations, we need a different strategy than a simple <code>lock</code> prefix.
+  </p></section><section id="x86-cas"><h4><a href="#x86-cas">x86 compare-and-exchange instruction</a></h4><p><a class="indexterm" id="index-compare-and-exchangeoperationsatomic-onx86-64"></a> <a class="indexterm" id="index-x86-64instructions-cmpxchgcompareandexchange"></a> <a class="indexterm" id="index-cmpxchgcompareandexchangeinstructionx86"></a> <a class="indexterm" id="index-instructions-compare-and-exchangeoperations"></a>
+In <a href="atomics.html#cas">"Compare-and-Exchange Operations" in Chapter 2</a>, we saw how any atomic fetch-and-modify operation can be implemented
+as a compare-and-exchange loop.
+This is exactly what the compiler will use for operations that
+cannot be represented by a single x86-64 instruction,
+since this architecture does include a (lock-prefixable) <code>cmpxchg</code> (compare and exchange) instruction.</p><p>We can see this in action by changing our last example from <code>fetch_<wbr>add</code> to <code>fetch_<wbr>or</code>:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled x86-64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;AtomicI32) -&gt; i32 {
+    x.fetch_or(10, Relaxed)
+}</pre></td><td><pre>a:
+    mov eax, dword ptr [rdi]
+.L1:
+    mov ecx, eax
+    or ecx, 10
+    lock cmpxchg dword ptr [rdi], ecx
+    jne .L1
+    ret</pre></td></tr></tbody></table></figure><p><a class="indexterm" id="index-x86-64instructions-or-2"></a> <a class="indexterm" id="index-orinstructionx86-2"></a>
+The first <code>mov</code> instruction loads the value from the atomic variable into the <code>eax</code> register.
+The following <code>mov</code> and <code>or</code> instructions copy that value into <code>ecx</code> and apply the binary <code>or</code> operation,
+such that <code>eax</code> contains the old value and <code>ecx</code> the new value.
+The <code>cmpxchg</code> instruction afterwards behaves exactly like the <code>compare_<wbr>exchange</code> method in Rust.
+Its first argument is the memory address on which to operate (the atomic variable),
+the second argument (<code>ecx</code>) is the new value, the expected value is implicitly taken from <code>eax</code>,
+and the return value is implicitly stored in <code>eax</code>.
+It also sets a status flag that a subsequent instruction
+can use to conditionally branch based on whether the operation succeeded or not.
+<a class="indexterm" id="index-x86-64instructions-jnejumpifnotequal"></a> <a class="indexterm" id="index-jnejumpifnotequalinstructionx86"></a>
+In this case, a <code>jne</code> (jump if not equal) instruction is used to jump back to the <code>.L1</code> label
+to try again on failure.</p><p>Here’s what the equivalent compare-and-exchange loop looks like in Rust, just like we saw in <a href="atomics.html#cas">"Compare-and-Exchange Operations" in Chapter 2</a>:</p><pre>pub fn a(x: &amp;AtomicI32) -&gt; i32 {
+    let mut current = x.load(Relaxed);
+    loop {
+        let new = current | 10;
+        match x.compare_exchange(current, new, Relaxed, Relaxed) {
+            Ok(v) =&gt; return v,
+            Err(v) =&gt; current = v,
+        }
+    }
+}</pre><p>Compiling this code results in the exact same assembly as the <code>fetch_<wbr>or</code> version.
+This shows that, at least on x86-64, they are indeed equivalent in every way.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>On x86-64, there is no difference between <code>compare_<wbr>exchange</code> and
+<code>compare_<wbr>exchange_<wbr>weak</code>. Both compile down to a <code>lock cmpxchg</code> instruction.
+   </p></div></div></section></section><section id="load-linked-and-store-conditional-instructions"><h3><a href="#load-linked-and-store-conditional-instructions">Load-Linked and Store-Conditional Instructions</a></h3><p><a class="indexterm" id="index-instructions-load-linkedstore-conditionalLLSCinstructions"></a> <a class="indexterm" id="index-load-linkedstore-conditionalLLSCloop"></a> 
+The closest thing to a compare-and-exchange loop on a RISC architecture is a <em>load-linked/store-conditional</em> (LL/SC) loop.
+It involves two special instructions that come in a pair:
+a load-linked instruction, which mostly behaves like a regular load instruction,
+and a store-conditional instruction, which mostly behaves like a regular store instruction.
+They are used in a pair, with both instructions targeting the same memory address.
+The key difference to the regular load and store instructions is that the store is conditional: it refuses to store to memory if any other thread has overwritten that memory since the load-linked instruction.</p><p>These two instructions allow us to load a value from memory, modify it, and store the new value back only if
+nobody has overwritten the value since we loaded it.
+If that fails, we can simply retry.
+Once it succeeds, we can safely pretend the whole operation was atomic, since it didn’t get disrupted.</p><p>The key to making these instructions feasible and efficient to implement is twofold:
+(1) only one memory address (per core) can be tracked at a time, and (2) the store-conditional is allowed to have false negatives,
+meaning that it may fail to store even though nothing has changed that particular piece of memory.</p><p>This makes it possible to be less precise when tracking changes to memory,
+at the cost of perhaps a few extra cycles through an LL/SC loop.
+Access to memory could be tracked not per byte, but per chunk of 64 bytes, or per kilobyte, or even the entire memory as a whole.
+Less accurate memory tracking results in more unnecessary cycles through LL/SC loops, significantly reducing performance,
+but also reducing implementation complexity.</p><p>Taking things to the extreme, a basic, hypothetical single-core system could use a strategy
+where it does not track writes to memory at all.
+Instead, it could track interrupts or context switches, the events that can cause the processor to switch to another thread.
+If, in a system without any parallelism, no such event happened,
+it could safely assume no other thread could have touched the memory.
+If any such event happened, it could just assume the worst, refuse the store,
+and hope for better luck in the next iteration of the loop.
+ </p><section id="arm-load-exclusive-and-store-exclusive"><h4><a href="#arm-load-exclusive-and-store-exclusive">ARM load-exclusive and store-exclusive</a></h4><p><a class="indexterm" id="index-load-linkedstore-conditionalLLSCloop-onARM64"></a> <a class="indexterm" id="index-fetch-and-modifyoperationsatomic-onARM64"></a>
+On ARM64, or at least in the first version of ARMv8, no atomic fetch-and-modify
+or compare-and-exchange operation can be represented by a single instruction.
+True to its RISC nature, the load and store steps are separate from the calculation and comparison.</p><p>ARM64’s load-linked and store-conditional instructions
+are called <code>ldxr</code> (load exclusive register) and <code>stxr</code> (store exclusive register).
+In addition, the <code>clrex</code> (clear exclusive) instruction can be used as an alternative to <code>stxr</code>
+to stop tracking writes to memory without storing anything.
+<a class="indexterm" id="index-ARM64instructions-stxrstoreexclusiveregister"></a> <a class="indexterm" id="index-stxrstoreexclusiveregisterinstructionARM"></a> <a class="indexterm" id="index-ARM64instructions-ldxrloadexclusiveregister"></a> <a class="indexterm" id="index-ldxrloadexclusiveregisterinstructionARM"></a> <a class="indexterm" id="index-ARM64instructions-clrexclearexclusive"></a> <a class="indexterm" id="index-clrexclearexclusiveinstructionARM"></a> <a class="indexterm" id="index-ARM64instructions-load-linkedandstore-conditionalinstructions"></a></p><p>To see them in action, let’s see what happens when we do an atomic addition on ARM64:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled ARM64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.fetch_add(10, Relaxed);
+}</pre></td><td><pre>a:
+.L1:
+    ldxr w8, [x0]
+    add w9, w8, #10
+    stxr w10, w9, [x0]
+    cbnz w10, .L1
+    ret</pre></td></tr></tbody></table></figure><p>We get something that looks quite similar to the non-atomic version we got before (in <a href="#rmw-ops">"Read-Modify-Write Operations"</a>):
+a load instruction, an add instruction, and a store instruction.
+The load and store instructions have been replaced by their "exclusive" LL/SC version,
+and a new <code>cbnz</code> (compare and branch on nonzero) instruction appeared.
+<a class="indexterm" id="index-ARM64instructions-cbnzcompareandbranchonnonzero"></a> <a class="indexterm" id="index-cbnzcompareandbranchonnonzeroinstructionARM"></a>
+The <code>stxr</code> instruction stores a zero in <code>w10</code> if it succeeded, or a one if it didn’t.
+The <code>cbnz</code> instruction uses this to restart the whole operation if it failed.</p><p>Note that unlike with <code>lock add</code> on x86-64, we don’t need to do anything special to retrieve the old value.
+In the example above, the old value will still be available in register <code>w8</code> after the operation succeeds,
+so there’s no need for a specialized instruction like <code>xadd</code>.</p><p>This LL/SC pattern is quite flexible: it doesn’t just work for a limited set of operations like <code>add</code> and <code>or</code>,
+but for virtually any operation.
+We can just as easily implement an atomic <code>fetch_<wbr>divide</code> or <code>fetch_<wbr>shift_<wbr>left</code> by putting the corresponding
+instruction(s) between the <code>ldxr</code> and <code>stxr</code> instructions.
+However, if there are too many instructions between them, there’s an increasingly high chance
+of disruption resulting in extra cycles.
+Generally, the compiler will attempt to keep the number of instructions in an LL/SC pattern as small as possible,
+to avoid LL/SC loops that would rarely—or even never—succeed and thus could spin forever.
+</p><aside id="armv81"><h5><a href="#armv81">ARMv8.1 Atomic Instructions</a></h5><p><a class="indexterm" id="index-ARMv81atomicinstructions"></a> <a class="indexterm" id="index-ARM64instructions-ARMv81atomicinstructions"></a>
+A later version of ARM64, part of ARMv8.1, also includes new CISC style instructions for common atomic operations.
+<a class="indexterm" id="index-ldaddloadandaddinstructionARM"></a>
+For example, the new <code>ldadd</code> (load and add) instruction is equivalent to an atomic <code>fetch_<wbr>add</code> operation,
+without the need for an LL/SC loop.
+It even includes instructions for operations like <code>fetch_<wbr>max</code>, which don’t exist on x86-64.</p><p><a class="indexterm" id="index-cascompareandswapinstructionARM"></a>
+It also includes a <code>cas</code> (compare and swap) instruction corresponding to <code>com⁠pare_<wbr>​exchange</code>.
+When this instruction is used, there’s no difference between <code>compare_<wbr>exchange</code> and <code>compare_<wbr>exchange_<wbr>weak</code>,
+just like on x86-64.</p><p>While the LL/SC pattern is quite flexible and nicely fits the general RISC pattern,
+these new instructions can be more performant, as they can be easier to optimize for with specialized hardware.
+ </p></aside></section><section id="compare-and-exchange-on-arm"><h4><a href="#compare-and-exchange-on-arm">Compare-and-exchange on ARM</a></h4><p><a class="indexterm" id="index-instructions-compare-and-exchangeoperations-2"></a> <a class="indexterm" id="index-compare-and-exchangeoperationsatomic-onARM64"></a>
+The <code>compare_<wbr>exchange</code> operation maps quite nicely
+onto this LL/SC pattern by using a conditional branch instruction
+to skip the store instruction if the comparison failed.
+Let’s look at the generated assembly:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled ARM64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.compare_exchange_weak(5, 6, Relaxed, Relaxed);
+}</pre></td><td><pre>a:
+    ldxr w8, [x0]
+    cmp w8, #5
+    b.ne .L1
+    mov w8, #6
+    stxr w9, w8, [x0]
+    ret
+.L1:
+    clrex
+    ret</pre></td></tr></tbody></table></figure><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>Note that a <code>compare_<wbr>exchange_<wbr>weak</code> operation is normally used in a loop
+that repeats if the comparison fails.
+For this example, however, we only call it once and ignore its return value,
+which shows us the relevant assembly without distractions.</p></div></div><p>The <code>ldxr</code> instruction loads the value, which is then immediately compared with the <code>cmp</code> (compare) instruction
+to the expected value of 5.
+<a class="indexterm" id="index-ARM64instructions-cmpcompare"></a> <a class="indexterm" id="index-cmpcompareinstructionARM"></a>
+The <code>b.ne</code> (branch if not equal) instruction will cause a jump to the <code>.L1</code> label if the value was not as expected,
+at which point the <code>clrex</code> instruction is used to abort the LL/SC pattern.
+<a class="indexterm" id="index-ARM64instructions-bnebranchifnotequal"></a> <a class="indexterm" id="index-bnebranchifnotequalinstructionARM"></a>
+If the value was five, the flow continues through the <code>mov</code> and <code>stxr</code> instructions to store the new value of six in memory, but only if nothing has overwritten the five in the meantime.
+<a class="indexterm" id="index-ARM64instructions-movmove"></a> <a class="indexterm" id="index-movmoveinstructionARM"></a></p><p>Remember that <code>stxr</code> is allowed to have false negatives; it might fail here even if the five wasn’t overwritten.
+That’s okay, because we’re using <code>compare_<wbr>exchange_<wbr>weak</code>, which is allowed to have false negatives too.
+In fact, this is the reason why a weak version of <code>compare_<wbr>exchange</code> exists.
+<a class="indexterm" id="index-compare-and-exchangeoperationsatomic-weak-onARM64"></a></p><p>If we replace <code>compare_<wbr>exchange_<wbr>weak</code> with <code>compare_<wbr>exchange</code>, we get
+nearly identical assembly, except for an extra branch to restart the operation if it failed:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled ARM64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.compare_exchange(5, 6, Relaxed, Relaxed);
+}</pre></td><td><pre>a:
+    mov w8, #6
+.L1:
+    ldxr w9, [x0]
+    cmp w9, #5
+    b.ne .L2
+    stxr w9, w8, [x0]
+    cbnz w9, .L1
+    ret
+.L2:
+    clrex
+    ret</pre></td></tr></tbody></table></figure><p>As expected, there’s now an extra <code>cbnz</code> (compare and branch on nonzero) instruction to
+restart the LL/SC loop on failure.
+Additionally, the <code>mov</code> instruction has been moved out of the loop, to keep the loop as short as possible.</p><aside id="compare-exchange-optimization"><h5><a href="#compare-exchange-optimization">Optimization of Compare-and-Exchange Loops</a></h5><p>As we saw in <a href="#x86-cas">"x86 compare-and-exchange instruction"</a>, a <code>fetch_<wbr>or</code> operation and the equivalent <code>compare_<wbr>exchange</code> loop
+compile down to the exact same instructions on x86-64.
+One might expect the same to happen on ARM, at least with
+<code>compare_<wbr>exchange_<wbr>weak</code>, as the load and weak compare-and-exchange operations
+could directly be mapped to the LL/SC instructions.
+<a class="indexterm" id="index-compare-and-exchangeoperationsatomic-compileroptimization"></a> <a class="indexterm" id="index-atomic-compare-and-exchangeoperations-compileroptimization"></a></p><p>Unfortunately, this is currently (as of Rust 1.66.0) not what happens.</p><p><a class="indexterm" id="index-compileroptimization-ofcompare-and-exchangeloops"></a> <a class="indexterm" id="index-load-linkedstore-conditionalLLSCloop-compileroptimization"></a>
+While this might change in the future as the compiler is always improving,
+it’s quite hard for a compiler to safely turn a manually written compare-and-exchange loop into the corresponding LL/SC loop.
+One of the reasons is that there’s a limit on the number and type of instructions that can
+be put between the <code>stxr</code> and <code>ldxr</code> instructions, which is not something that
+the compiler is designed to keep in mind while applying other optimizations.
+At the time where patterns like a compare-and-exchange loop are still recognizable,
+the exact instructions that an expression will compile down to are not known yet,
+making this a very tricky optimization to implement for the general case.</p><p>So, at least until we get even smarter compilers, it’s advisable to use the dedicated fetch-and-modify methods rather than a compare-and-exchange loop,
+if possible.
+  </p></aside></section></section></section><section id="caching"><h2><a href="#caching">Caching</a></h2><p> <a class="indexterm" id="index-cachingprocessors"></a>
+Reading and writing memory is slow, and can easily cost as much time as executing tens or hundreds of instructions.
+This is why all performant processors implement <em>caching</em>, to avoid interacting
+with the relatively slow memory as much as possible.
+The exact implementation details of memory caches in modern processors are complex, partially proprietary,
+and, most importantly, mostly irrelevant to us when writing software.
+After all, the name <em>cache</em> comes from the French word <em>caché</em>, meaning <em>hidden</em>.
+Nevertheless, understanding the basic principles behind how most processors implement caching
+can be extremely useful when optimizing software for performance.
+(Not that we need an excuse to learn more about an interesting topic, of course.)</p><p>Except for very small microcontrollers, virtually all modern processors use caching.
+Such a processor never interacts directly with main memory,
+but instead routes every single read and write request through its cache.
+If an instruction needs to read something from memory,
+the processor will ask its cache for that data.
+If it is already cached, the cache will quickly respond with the cached data, avoiding interacting with main memory.
+Otherwise, it’ll have to take the slow path, where the cache might have to ask the main memory for a copy of the relevant data.
+Once the main memory responds, not only will the cache finally respond to the original read request,
+but it will also remember the data, such that it can respond more quickly the next time this data is requested.
+If the cache becomes full, it makes space by dropping some old data it deems least likely to be useful.</p><p>When an instruction wants to write something to memory,
+the cache could decide to hold on to the modified data without writing it to main memory.
+Any subsequent read requests for the same memory address will then get a copy of the modified data,
+ignoring the outdated data in main memory.
+It would only actually write the data back to main memory
+when the modified data needs to be dropped from the cache to make space.</p><p>In most processor architectures, the cache reads and writes memory in blocks of 64 bytes,
+even if only a single byte was requested.
+<a class="indexterm" id="index-cachelines"></a>
+These blocks are often called <em>cache lines</em>.
+By caching the entire 64-byte block that surrounds the requested byte,
+any subsequent instructions that need to access any of the other bytes in that block will not have to wait for main memory.</p><section id="cache-coherence"><h3><a href="#cache-coherence">Cache Coherence</a></h3><p><a class="indexterm" id="index-cachecoherence"></a>
+In modern processors, there is usually more than one layer of caching.
+<a class="indexterm" id="index-L1L2L3L4cache"></a>
+The first cache, or <em>level one (L1) cache</em> is the smallest and fastest.
+Instead of talking to the main memory, it talks to the level two (L2) cache,
+which is much larger, but slower.
+The L2 cache might be the one to talk to main memory, or there might be yet another, larger and slower, L3 cache—perhaps even an L4 cache.</p><p><a class="indexterm" id="index-cachingprocessors-percore"></a>
+Adding extra layers doesn’t change much about how they work; each layer can operate independently.
+Where things get interesting, however, is when there are multiple processor cores that each have their own cache.
+In a multi-core system, each processor core usually has its own L1 cache, while
+the L2 or L3 caches are often shared with some or all of the other cores.</p><p>A naive caching implementation would break down under these conditions,
+as the cache can no longer assume it controls all interactions with the next layer.
+If one cache would accept a write and mark some cache line as modified without informing the other caches,
+the state of the caches could become inconsistent.
+Not only would the modified data not be available to the other cores
+until the cache writes the data down to the next level(s),
+it could end up conflicting with different modifications cached in other caches.</p><p><a class="indexterm" id="index-cachecoherence-protocol"></a>
+To solve this problem, a <em>cache coherence protocol</em> is used.
+Such a protocol defines how exactly the caches operate and communicate with each other
+to keep everything in a consistent state.
+The exact protocol used varies per architecture, processor model, and even per cache level.</p><p>We’ll discuss two basic cache coherence protocols. Modern processors use many variations of these.</p><section id="the-write-through-protocol"><h4><a href="#the-write-through-protocol">The write-through protocol</a></h4><p><a class="indexterm" id="index-cachecoherence-protocol-write-through"></a> <a class="indexterm" id="index-write-throughcachecoherenceprotocol"></a>
+In caches that implement the <em>write-through cache coherence protocol</em>,
+writes are not cached but immediately sent through to the next layer.
+The other caches are connected to the next layer through the same shared communication channel,
+which means that they can observe the other caches' communications to the next layer.
+When a cache observes a write for an address it currently has cached,
+it immediately either drops or updates its own cache line to keep everything consistent.</p><p>Using this protocol, caches never contain any cache lines in a modified state. While this simplifies things significantly, it nullifies any benefits of caching for writes.
+When optimizing just for reading, this can be a great choice.</p></section><section id="mesi"><h4><a href="#mesi">The MESI protocol</a></h4><p><a class="indexterm" id="index-cachecoherence-protocol-MESI"></a> <a class="indexterm" id="index-MESIcachecoherenceprotocol"></a>
+The <em>MESI cache coherence protocol</em> is named after the four possible states it defines for a cache line:
+modified, exclusive, shared and invalid.
+Modified (M) is used for cache lines that contain data that has been modified but not yet written
+to memory (or the next level cache).
+Exclusive (E) is used for cache lines that contain unmodified data that’s not cached in any other cache (at the same level).
+Shared (S) is used for unmodified cache lines that might also appear in one or more of the other (same level) caches.
+Invalid (I) is used for unused (empty or dropped) cache lines, which do not contain any useful data.</p><p>Caches that use this protocol communicate with all the other caches at the same level.
+They send each other updates and requests to make it possible for them to stay consistent with each other.</p><p><a class="indexterm" id="index-cachemiss"></a>
+When a cache gets a request for an address it has not yet cached, also called a <em>cache miss</em>,
+it does not immediately request it from the next layer.
+Instead, it first asks the other caches (at the same level) if any of them have this cache line available.
+If none of them have it, the cache will continue to request the address from the (slower) next layer,
+and mark the resulting new cache line as exclusive (E).
+When this cache line is then modified by a write operation, the cache can change the state to modified (M)
+without informing the others, since it knows none of the others have the same cache line cached.</p><p>When requesting a cache line that’s already available in any of the other caches,
+the result is a shared (S) cache line, obtained directly from the other cache(s).
+If the cache line was in the modified (M) state, it’ll first be written (or <em>flushed</em>) to the next layer,
+before changing it to shared (S) and sharing it.
+If it was in the exclusive (E) state, it’ll be changed to shared (S) immediately.</p><p>If the cache wants exclusive rather than shared access
+(for example, because it is going to modify the data right after),
+the other cache(s) will not keep the cache line in shared (S) state,
+but instead drop it entirely by changing it to invalid (I).
+In this case, the result is an exclusive (E) cache line.</p><p>If a cache needs exclusive access to a cache line it already has available in the shared (S) state,
+it simply tells the others to drop the cache line before upgrading it to exclusive (E).</p><p><a class="indexterm" id="index-cachecoherence-protocol-MOESI"></a> <a class="indexterm" id="index-MOESIcachecoherenceprotocol"></a> <a class="indexterm" id="index-cachecoherence-protocol-MESIF"></a> <a class="indexterm" id="index-MESIFcachecoherenceprotocol"></a>
+There are several variations of this protocol.
+For example, the <em>MOESI</em> protocol adds an extra state to allow sharing
+of modified data without immediately writing it to the next layer,
+and the <em>MESIF</em> protocol uses an extra state to decide which cache responds to a
+request for a shared cache line that’s available in multiple caches.
+Modern processors often use more elaborate and proprietary cache coherence protocols.
+</p></section></section><section id="performance-experiment"><h3><a href="#performance-experiment">Impact on Performance</a></h3><p><a class="indexterm" id="index-cachingprocessors-performanceexperiment"></a>
+While caching is mostly hidden from us, caching behavior can have significant
+effects on the performance of our atomic operations.
+Let’s try to measure some of those effects.</p><p><a class="indexterm" id="index-benchmarking"></a>
+Measuring the speed of a single atomic operation is very tricky, since they are extremely fast.
+To be able to get some useful numbers, we’ll have to repeat an operation, say, a billion times,
+and measure how long that takes in total.
+For example, we could try to measure the time it takes for a billion load operations like this:</p><pre>static A: AtomicU64 = AtomicU64::new(0);
+
+fn main() {
+    let start = Instant::now();
+    for _ in 0..1_000_000_000 {
+        A.load(Relaxed);
+    }
+    println!("{:?}", start.elapsed());
+}</pre><p>Unfortunately, this does not work as expected.</p><p><a class="indexterm" id="index-compileroptimization-enabling-2"></a> <a class="indexterm" id="index---releaseflagcargo-2"></a> <a class="indexterm" id="index--Oflagrustc-2"></a>
+When running this with optimizations turned on (e.g., with <code>cargo run --release</code> or <code>rustc -O</code>),
+we’ll see an unreasonably low measured time.
+What happened is that the compiler was smart enough to understand that we’re not using the loaded values,
+so it decided to completely optimize the "unnecessary" loop away.</p><p><a class="indexterm" id="index-hintblackbox"></a> <a class="indexterm" id="index-blackbox"></a> <a class="indexterm" id="index-compileroptimization-blackboxavoidingwith"></a> <a class="indexterm" id="index-benchmarking-blackboxavoidingoptimizationswith"></a>
+To avoid this, we can use the special <code>std::<wbr>hint::<wbr>black_<wbr>box</code> function.
+This function takes an argument of any type, which it just returns without doing anything.
+What makes this function special is that the compiler will try its best not to assume anything
+about what the function does; it treats it like a "black box" that could do anything.</p><p>We can use this to avoid certain optimizations that would render a benchmark useless.
+In this case, we can pass the result of the load operation to <code>black_<wbr>box()</code> to
+stop any optimizations that assume we don’t actually need the loaded values.
+That’s not enough, though, since the compiler could still assume that <code>A</code> is always zero,
+making the load operations unnecessary.
+To avoid that, we can pass a reference to <code>A</code> to <code>black_<wbr>box()</code> at the start,
+such that the compiler may no longer assume there’s only one thread that accesses <code>A</code>.
+After all, it must assume that <code>black_<wbr>box(&amp;A)</code> might have spawned an extra thread that interacts with <code>A</code>.</p><p>Let’s try that out:</p><pre>use std::hint::black_box;
+
+static A: AtomicU64 = AtomicU64::new(0);
+
+fn main() {
+    black_box(&amp;A); // New!
+    let start = Instant::now();
+    for _ in 0..1_000_000_000 {
+        black_box(A.load(Relaxed)); // New!
+    }
+    println!("{:?}", start.elapsed());
+}</pre><p>The output fluctuates a bit when running this multiple times,
+but on a not-so-recent x86-64 computer, it seems to give a result of about 300 milliseconds.</p><p>To see any caching effects, we’ll spawn a background thread that interacts with the atomic variable.
+That way, we can see if it affects the load operations of the main thread or not.</p><p>First, let’s try that with just load operations on the background thread, as follows:</p><pre>static A: AtomicU64 = AtomicU64::new(0);
+
+fn main() {
+    black_box(&amp;A);
+
+    thread::spawn(|| { // New!
+        loop {
+            black_box(A.load(Relaxed));
+        }
+    });
+
+    let start = Instant::now();
+    for _ in 0..1_000_000_000 {
+        black_box(A.load(Relaxed));
+    }
+    println!("{:?}", start.elapsed());
+}</pre><p>Note that we’re not measuring the performance of the operations on the background thread.
+We’re still only measuring how long it takes for the main thread to perform a billion load operations.</p><p>Running this program results in similar measurements as before: it fluctuates a bit around 300 milliseconds
+when tested on the same x86-64 computer.
+The background thread has no significant effect on the main thread.
+They presumably each run on a separate processor core, but the caches of <em>both</em> cores
+contain a copy of <code>A</code>, allowing for very fast access.</p><p>Now let’s change the background thread to perform store operations instead:</p><pre>static A: AtomicU64 = AtomicU64::new(0);
+
+fn main() {
+    black_box(&amp;A);
+    thread::spawn(|| {
+        loop {
+            A.store(0, Relaxed); // New!
+        }
+    });
+    let start = Instant::now();
+    for _ in 0..1_000_000_000 {
+        black_box(A.load(Relaxed));
+    }
+    println!("{:?}", start.elapsed());
+}</pre><p>This time, we do see a significant difference.
+Running this program on the same x86-64 machine now results in an output that fluctuates around
+three whole seconds, almost ten times as much as before.
+More recent computers will show a less significant but still very measurable difference.
+For example, it went from 350 milliseconds to 500 milliseconds on a recent Apple M1 processor,
+and from 250 milliseconds to 650 milliseconds on a very recent x86-64 AMD processor.</p><p>This behavior matches our understanding of cache coherence protocols:
+a store operation requires exclusive access to a cache line, which slows down
+subsequent load operations on other cores that no longer share the cache line.</p><aside id="failing-compare-exchange"><h4><a href="#failing-compare-exchange">Failing Compare-and-Exchange Operations</a></h4><p><a class="indexterm" id="index-cachingprocessors-compare-and-exchangeoperationseffectof"></a> <a class="indexterm" id="index-compare-and-exchangeoperationsatomic-cachingeffecton"></a> <a class="indexterm" id="index-atomic-compare-and-exchangeoperations-cachingeffecton"></a>
+Interestingly, on most processor architectures, the same effect we saw with store operations also happens
+when the background thread performs only compare-and-exchange operations, even if they all fail.</p><p>To try that out, we can replace the store operation (of the background thread) with a call to <code>compare_<wbr>exchange</code>
+that will never succeed:</p><pre>    …
+        loop {
+            // Never succeeds, because A is never 10.
+            black_box(A.compare_exchange(10, 20, Relaxed, Relaxed).is_ok());
+        }
+    …</pre><p>Because <code>A</code> is always zero, this <code>compare_<wbr>exchange</code> operation will never succeed.
+It’ll load the current value of <code>A</code>, but never update it to a new value.</p><p>One might reasonably expect this to behave the same as a load operation, since
+it does not modify the atomic variable.
+However, on most processor architectures, the instruction(s) of <code>compare_<wbr>exchange</code> will claim
+exclusive access of the relevant cache line regardless of whether the comparison succeeds or not.</p><p><a class="indexterm" id="index-spinlocks-compare-and-exchangenotusing"></a>
+This means that it can be beneficial to not use <code>compare_<wbr>exchange</code> (or <code>swap</code>) in a spin loop
+like we did for our <code>SpinLock</code> in <a href="building-spinlock.html">Chapter 4</a>, but instead use a <code>load</code> operation
+first to check if the lock has been unlocked.
+That way, we avoid unnecessarily claiming exclusive access to the relevant cache line.</p></aside><p><a class="indexterm" id="index-cachelines-performanceexperiment"></a>
+Since caching happens per cache line, not per individual byte or variable,
+we should be able to see the same effect using adjacent variables rather than the same one.
+To try this out, let’s use three atomic variables instead of one,
+have the main thread use only the middle variable, and make the background thread use only the other two, <span>as follows</span>:</p><pre>static A: [AtomicU64; 3] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn main() {
+    black_box(&amp;A);
+    thread::spawn(|| {
+        loop {
+            A[0].store(0, Relaxed);
+            A[2].store(0, Relaxed);
+        }
+    });
+    let start = Instant::now();
+    for _ in 0..1_000_000_000 {
+        black_box(A[1].load(Relaxed));
+    }
+    println!("{:?}", start.elapsed());
+}</pre><p>Running this produces similar results as before: it takes several seconds on that same x86-64 computer.
+Even though <code>A[0]</code>, <code>A[1]</code>, and <code>A[2]</code> are each used by only one thread,
+we still see the same effects as if we’re using the same variable on both threads.
+The reason is that <code>A[1]</code> shares a cache line with either or both of the others.
+The processor core running the background thread repeatedly claims exclusive access
+to the cache line(s) containing <code>A[0]</code> and <code>A[2]</code>, which also contains <code>A[1]</code>,
+slowing down "unrelated" operations on <code>A[1]</code>.
+<a class="indexterm" id="index-falsesharing"></a>
+This effect is called <em>false sharing</em>.</p><p>We can avoid this by spacing the atomic variables further apart, so they each get their own cache line.
+As mentioned before, 64 bytes is a reasonable guess for the size of a cache line,
+so let’s try wrapping our atomics in a 64-byte aligned struct, as follows:</p><pre>#[repr(align(64))] // This struct must be 64-byte aligned.
+struct Aligned(AtomicU64);
+
+static A: [Aligned; 3] = [
+    Aligned(AtomicU64::new(0)),
+    Aligned(AtomicU64::new(0)),
+    Aligned(AtomicU64::new(0)),
+];
+
+fn main() {
+    black_box(&amp;A);
+    thread::spawn(|| {
+        loop {
+            A[0].0.store(1, Relaxed);
+            A[2].0.store(1, Relaxed);
+        }
+    });
+    let start = Instant::now();
+    for _ in 0..1_000_000_000 {
+        black_box(A[1].0.load(Relaxed));
+    }
+    println!("{:?}", start.elapsed());
+}</pre><p><a class="indexterm" id="index-repralign"></a> <a class="indexterm" id="index-alignment"></a>
+The <code>#[repr(align)]</code> attribute enables us to tell the compiler
+the (minimal) alignment of our type, in bytes.
+Since an <code>AtomicU64</code> is only 8 bytes, this will add 56 bytes of padding to our <code>Aligned</code> struct.</p><p>Running this program no longer gives slow results.
+Instead, we get the same results as when we had no background thread at all:
+about 300 milliseconds when run on the same x86-64 computer as before.</p><div class="note" role="note" aria-label="tip"><div class="icon" aria-hidden="true"><i class="tip"></i></div><div class="text"><p>Depending on the type of processor you’re trying this on, you might need
+to use 128-byte alignment to see the same effect.</p></div></div><p>The experiment above shows that it can be advisable not to
+put unrelated atomic variables close to each other.
+For example, a dense array of small mutexes might not always perform as well as
+an alternative structure that keeps the mutexes spaced further apart.</p><p>On the other hand, when multiple (atomic) variables are related and often accessed in quick succession,
+it can be good to put them close together.
+<a class="indexterm" id="index-spinlocks-cachelineseffectof"></a>
+For example, our <code>SpinLock&lt;T&gt;</code> from <a href="building-spinlock.html">Chapter 4</a> stores the <code>T</code> right next to the <code>AtomicBool</code>,
+which means it’s likely that the cache line containing the <code>AtomicBool</code> will also contain the <code>T</code>,
+such that a claim for (exclusive) access to one also includes the other.
+Whether this is beneficial depends entirely on the situation.
+  </p></section></section><section id="reordering"><h2><a href="#reordering">Reordering</a></h2><p><a class="indexterm" id="index-reorderinginstructions-2"></a>
+Consistent caching, for example through the MESI protocol we explored earlier in this chapter,
+generally does not affect correctness of a program, even when multiple threads are involved.
+The only observable differences caused by consistent caching come down to differences in timing.
+However, modern processors implement many more optimizations that can have a big impact on correctness,
+at least when multiple threads are involved.</p><p>At the start of <a href="memory-ordering.html">Chapter 3</a>, we briefly discussed <em>instruction reordering</em>,
+how both the compiler and the processor can change the order of instructions.
+Focusing just on the processor, here are some examples of various ways in which instructions, or their effects,
+might happen <em>out of order</em>:</p><dl><dt>Store buffers </dt><dd><p>Since writes can be slow, even with caching, processor cores often include a <em>store buffer</em>.
+<a class="indexterm" id="index-storebuffers"></a>
+Write operations to memory can be stored in this store buffer, which is very quick, to allow the processor
+to immediately continue with the instructions that follow.
+Then, in the background, the write operation is completed by writing to the (L1) cache,
+which can be significantly slower.
+This way, the processor does not have to wait while the cache coherence protocol jumps into action
+to get exclusive access to the relevant cache line.</p><p>As long as special care is taken to handle subsequent read operations from the same memory address,
+this is entirely invisible for instructions running as part of the same thread, on the same processor core.
+However, for a brief moment, the write operation is not yet visible to the other cores,
+resulting in an inconsistent view of what the memory looks like from different threads running on <span>different cores</span>.</p></dd><dt>Invalidation queues </dt><dd><p>Regardless of the exact coherency protocol, caches that operate in parallel need to process invalidation requests:
+instructions to drop a specific cache line because it’s about to be modified and become invalid.
+<a class="indexterm" id="index-invalidationqueues"></a>
+As a performance optimization, it’s common for such requests not to be
+processed immediately, but to be queued for (slightly) later processing instead.
+When such invalidation queues are in use, the caches are no longer always consistent,
+as cache lines might be briefly outdated before they are dropped.
+However, this has no impact on a single threaded program, other than speeding it up.
+The only impact is the visibility of write operations from other cores,
+which might now appear as (very slightly) delayed.</p></dd><dt>Pipelining </dt><dd><p><a class="indexterm" id="index-pipelining"></a>
+Another very common processor feature that significantly improves performance is <em>pipelining</em>:
+executing consecutive instructions in parallel, if possible.
+Before an instruction finishes executing,
+the processor might already start executing the next one.
+Modern processors can often start the execution of quite a few instructions in
+series while the first one is still in progress.</p><p>If each instruction operates on the result from the previous one, this doesn’t help much;
+they each still need to wait on the result of the one before it.
+But when an instruction can be executed independently of the previous one, it might even finish first.
+For example, an instruction that just increments a register might finish very quickly,
+while a previously started instruction might still be waiting on reading something from memory,
+or some other slow operation.</p><p>While this doesn’t affect a single threaded program (other than speed),
+interaction with other cores might happen out of order when an instruction that operates on memory
+finishes executing before a preceding one does.</p></dd></dl><p>There are many ways in which a modern processor might end up executing
+instructions in an entirely different order than expected.
+There are many proprietary techniques involved,
+some of which become public only when a subtle mistake is found that can be exploited by malicious software.
+When they work as expected, however, they all have one thing in common:
+they do not affect single threaded programs, other than timing, but can cause interaction with
+other cores to appear to happen in an inconsistent order.</p><p>Processor architectures that allow for memory operations to be reordered
+also provide a way to prevent this through special instructions.
+These instructions might, for example, force the processor to flush its store buffer,
+or to finish any pipelined instructions, before continuing.
+Sometimes, these instructions only prevent a certain type of reordering.
+For example, there might be an instruction to prevent store operations from
+being reordered with respect to each other,
+while still allowing load operations to be reordered.
+Which types of reordering might happen, and how they can be prevented, depends on the processor architecture.
+</p></section><section id="memory-ordering"><h2><a href="#memory-ordering">Memory Ordering</a></h2><p><a class="indexterm" id="index-instructions-memoryordering"></a> <a class="indexterm" id="index-memoryordering-atprocessorlevel"></a>
+When performing any atomic operation in a language like Rust or C, we specify a memory ordering
+to inform the compiler of our ordering requirements.
+The compiler will generate the right instructions for the processor to prevent it from
+reordering instructions in ways that would break the rules.</p><p><a class="indexterm" id="index-reorderinginstructions-memoryordering"></a>
+Which types of instruction reordering are allowed depends on the kind of memory operation.
+For non-atomic and relaxed atomic operations, any type of reordering is acceptable.
+At the other extreme, sequentially consistent atomic operations don’t allow for any type of reordering at all.</p><p>An acquire operation may not get reordered with any memory operations that follow,
+while a release operation may not be reordered with any memory operations that precede it.
+Otherwise, some mutex-protected data might be accessed before acquiring—​or after releasing—​its mutex, resulting in a data race.</p><aside id="other-multi-copy-atomicity"><h3><a href="#other-multi-copy-atomicity">Other-Multi-Copy Atomicity</a></h3><p><a class="indexterm" id="index-multi-copyatomicity"></a> <a class="indexterm" id="index-other-multi-copyatomicity"></a>
+The ways in which the order of memory operations is affected on some processor architectures,
+such as those one might find in graphics cards,
+cannot always be explained by instruction reordering.
+The effect of two consecutive store operations on one core
+might become visible in the same order on a second core,
+but in opposite order on a third core.
+This could happen, for example, because of inconsistent caching or shared store buffers.
+This effect can’t be explained by the instructions on the first core being reordered,
+as that doesn’t explain the inconsistency between the second and third core’s observations.</p><p>The theoretical memory model we discussed in <a href="memory-ordering.html">Chapter 3</a> leaves space for such processor architectures by not requiring a globally consistent order for anything but sequentially consistent atomic operations.
+<a class="indexterm" id="index-x86-64processorarchitecture-other-multi-copyatomic"></a> <a class="indexterm" id="index-ARM64processorarchitecture-other-multi-copyatomic"></a></p><p>The architectures we’re focusing on in this chapter, x86-64 and ARM64, are <em>other-multi-copy atomic</em>, which means that write operations, once they are visible to any core, become visible to all cores at the same time.
+For other-multi-copy atomic architectures, memory ordering is only a matter of instruction reordering.</p></aside><p>Some architectures, such as ARM64, are called <em>weakly ordered</em>,
+as they allow the processor to freely reorder any memory operation.
+On the other hand, <em>strongly ordered</em> architectures, such as x86-64, are very
+restrictive about which memory operations may be reordered.</p><section id="x86-64-strongly-ordered"><h3><a href="#x86-64-strongly-ordered">x86-64: Strongly Ordered</a></h3><p><a class="indexterm" id="index-x86-64processorarchitecture-stronglyordered"></a> <a class="indexterm" id="index-memoryordering-onx86-64"></a>
+On an x86-64 processor, a load operation will never appear to have happened after a memory operation that follows.
+Similarly, this architecture doesn’t allow for a store operation to appear to have happened before a preceding
+memory operation.
+The only kind of reordering you might see on x86-64
+is a store operation getting delayed until after a later load operation.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p><a class="indexterm" id="index-processorarchitecture-stronglyordered"></a> <a class="indexterm" id="index-stronglyorderedarchitecture"></a>
+Because of the reordering restrictions of the x86-64 architecture,
+it is often described as a <em>strongly ordered</em> architecture,
+although some prefer to reserve this term for architectures that preserve the order of <em>all</em> memory operations.</p></div></div><p>These restrictions satisfy all the needs of acquire-loads (because a load is never reordered with a later operation),
+and of release-stores (because a store is never reordered with an earlier operation).
+<a class="indexterm" id="index-releaseandacquirememoryordering-onx86-64"></a>
+This means that on x86-64, we get release and acquire semantics "for free":
+release and acquire operations are identical to relaxed operations.</p><p>We can verify this by seeing what happens to a few of the snippets from <a href="#load-store-ops">"Load and Store"</a> and <a href="#lock-prefix">"x86 lock prefix"</a>
+when we change <code>Relaxed</code> to <code>Release</code>, <code>Acquire</code>, or <code>AcqRel</code>:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled x86-64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.store(0, Release);
+}</pre></td><td><pre>a:
+    mov dword ptr [rdi], 0
+    ret</pre></td></tr><tr><td><pre>pub fn a(x: &amp;AtomicI32) -&gt; i32 {
+    x.load(Acquire)
+}</pre></td><td><pre>a:
+    mov eax, dword ptr [rdi]
+    ret</pre></td></tr><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.fetch_add(10, AcqRel);
+}</pre></td><td><pre>a:
+    lock add dword ptr [rdi], 10
+    ret</pre></td></tr></tbody></table></figure><p>As expected, the assembly is identical, even though we specified a stronger <span>memory ordering</span>.</p><p>We can conclude that on x86-64, ignoring potential compiler optimizations,
+acquire and release operations are just as cheap as relaxed operations.
+Or, perhaps more accurately, that relaxed operations are just as expensive as acquire and release operations.</p><p>Let’s check out what happens for <code>SeqCst</code>:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled x86-64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.store(0, SeqCst);
+}</pre></td><td><pre>a:
+    xor eax, eax
+    xchg dword ptr [rdi], eax
+    ret</pre></td></tr><tr><td><pre>pub fn a(x: &amp;AtomicI32) -&gt; i32 {
+    x.load(SeqCst)
+}</pre></td><td><pre>a:
+    mov eax, dword ptr [rdi]
+    ret</pre></td></tr><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.fetch_add(10, SeqCst);
+}</pre></td><td><pre>a:
+    lock add dword ptr [rdi], 10
+    ret</pre></td></tr></tbody></table></figure><p>The <code>load</code> and <code>fetch_<wbr>add</code> operations still result in the same assembly as before,
+but assembly for <code>store</code> changed completely.
+The <code>xor</code> instruction looks a bit out of place, but is just a common way to set the <code>eax</code> register to zero
+by <code>xor</code>'ing it with itself, which always results in zero.
+A <code>mov eax, 0</code> instruction would’ve worked as well, but takes a bit more space.</p><p>The interesting part is the <code>xchg</code> instruction, which is normally used for a swap operation:
+a store operation that also retrieves the old value.
+<a class="indexterm" id="index-x86-64instructions-xchgexchange-2"></a> <a class="indexterm" id="index-xchgexchangeinstructionx86-2"></a></p><p>A regular <code>mov</code> instruction like before wouldn’t suffice for a <code>SeqCst</code> store, because it would allow reordering it with a later load operation, breaking the globally consistent order.
+By changing it to an operation that also performs a load, even though we don’t care about the value it loads,
+we get the additional guarantee of our instruction not getting reordered with later memory operations,
+solving the issue.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>A <code>SeqCst</code> load operation can still be a regular <code>mov</code>, exactly because <code>SeqCst</code> stores are upgraded to <code>xchg</code>.
+<code>SeqCst</code> operations guarantee a globally consistent order only with other <code>SeqCst</code> operations.
+The <code>mov</code> from a <code>SeqCst</code> load might still be reordered with the <code>mov</code> of an earlier non-<code>SeqCst</code> store operation,
+but that’s perfectly fine.</p></div></div><p><a class="indexterm" id="index-sequentiallyconsistentmemoryordering-onx86-64"></a>
+On x86-64, a store operation is the only atomic operation for which there’s a difference between <code>SeqCst</code> and
+weaker memory ordering.
+In other words, x86-64 <code>SeqCst</code> operations other than stores are just as cheap
+as <code>Release</code>, <code>Acquire</code>, <code>AcqRel</code>, and even <code>Relaxed</code> operations.
+Or, if you prefer, x86-64 makes <code>Relaxed</code> operations other than stores as
+expensive as <code>SeqCst</code> operations.
+ </p></section><section id="arm64-weakly-ordered"><h3><a href="#arm64-weakly-ordered">ARM64: Weakly Ordered</a></h3><p><a class="indexterm" id="index-ARM64processorarchitecture-weaklyordered"></a> <a class="indexterm" id="index-memoryordering-onARM64"></a> <a class="indexterm" id="index-processorarchitecture-weaklyordered"></a> <a class="indexterm" id="index-weaklyorderedarchitecture"></a>
+On a <em>weakly ordered</em> architecture such as ARM64,
+all memory operations can potentially be reordered with each other.
+This means that unlike x86-64, acquire and release operations will not be identical to relaxed operations.
+<a class="indexterm" id="index-releaseandacquirememoryordering-onARM64"></a></p><p>Let’s take a look at what happens on ARM64 for <code>Release</code>, <code>Acquire</code>, and <code>AcqRel</code>:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled ARM64</th></tr></thead><tbody><tr><td><pre><code>pub</code><code> </code><code>fn</code> <code>a</code><code>(</code><code>x</code>: <code>&amp;</code><code>AtomicI32</code><code>)</code><code> </code><code>{</code><code></code>
+<code>    </code><code>x</code><code>.</code><code>store</code><code>(</code><code>0</code><code>,</code><code> </code><code>Release</code><code>);</code><code></code>
+<code>}</code><code></code></pre></td><td><pre>a:
+    stlr wzr, [x0] <span class="callout">1</span>
+    ret</pre></td></tr><tr><td><pre><code>pub</code><code> </code><code>fn</code> <code>a</code><code>(</code><code>x</code>: <code>&amp;</code><code>AtomicI32</code><code>)</code><code> </code>-&gt; <code>i32</code> <code>{</code><code></code>
+<code>    </code><code>x</code><code>.</code><code>load</code><code>(</code><code>Acquire</code><code>)</code><code></code>
+<code>}</code><code></code></pre></td><td><pre>a:
+    ldar w0, [x0] <span class="callout">2</span>
+    ret</pre></td></tr><tr><td><pre><code>pub</code><code> </code><code>fn</code> <code>a</code><code>(</code><code>x</code>: <code>&amp;</code><code>AtomicI32</code><code>)</code><code> </code><code>{</code><code></code>
+<code>    </code><code>x</code><code>.</code><code>fetch_add</code><code>(</code><code>10</code><code>,</code><code> </code><code>AcqRel</code><code>);</code><code></code>
+<code>}</code><code></code></pre></td><td><pre>a:
+.L1:
+    ldaxr w8, [x0] <span class="callout">3</span>
+    add w9, w8, #10
+    stlxr w10, w9, [x0] <span class="callout">4</span>
+    cbnz w10, .L1
+    ret</pre></td></tr></tbody></table></figure><p>The changes, compared to the <code>Relaxed</code> versions we saw earlier, are very subtle:</p><p><span class="callout">1</span> <code>str</code> (store register) is now <code>stlr</code> (store-release register).
+<a class="indexterm" id="index-stlrstore-releaseregisterinstructionARM"></a> <a class="indexterm" id="index-ARM64instructions-stlrstore-releaseregister"></a></p><p><span class="callout">2</span> <code>ldr</code> (load register) is now <code>ldar</code> (load-acquire register).
+<a class="indexterm" id="index-ldarload-acquireregisterinstructionARM"></a> <a class="indexterm" id="index-ARM64instructions-ldarload-acquireregister"></a></p><p><span class="callout">3</span> <code>ldxr</code> (load exclusive register) is now <code>ldaxr</code> (load-acquire exclusive register).
+<a class="indexterm" id="index-ldaxrload-acquireexclusiveregisterinstructionARM"></a> <a class="indexterm" id="index-ARM64instructions-ldaxrload-acquireexclusiveregister"></a></p><p><span class="callout">4</span> <code>stxr</code> (store exclusive register) is now <code>stlxr</code> (store-release exclusive register).
+<a class="indexterm" id="index-stlxrstore-releaseexclusiveregisterinstructionARM"></a> <a class="indexterm" id="index-ARM64instructions-stlxrstore-releaseexclusiveregister"></a></p><p>As this shows, ARM64 has special versions of its load and store instructions for acquire and release ordering.
+Unlike an <code>ldr</code> or <code>ldxr</code> instruction, an <code>ldar</code> or <code>ldaxr</code> instruction will
+never be reordered with any later memory operation.
+Similarly, unlike an <code>str</code> or <code>stxr</code> instruction, an <code>stlr</code> or <code>stlxr</code>
+instruction will never be reordered with any earlier memory operation.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>A fetch-and-modify operation using only <code>Release</code> or <code>Acquire</code> ordering instead of <code>AcqRel</code>
+uses only one of the <code>stlxr</code> and <code>ldaxr</code> instructions, respectively,
+paired with a regular <code>ldxr</code> or <span><code>stxr</code> instruction</span>.</p></div></div><p>In addition to the restrictions required for release and acquire semantics,
+none of the special acquire and release instructions is ever reordered
+with any other of these special instructions, making them also suitable for <code>SeqCst</code>.
+<a class="indexterm" id="index-sequentiallyconsistentmemoryordering-onARM64"></a></p><p>As demonstrated below, upgrading to <code>SeqCst</code> results in the exact same assembly <span>as before</span>:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled ARM64</th></tr></thead><tbody><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.store(0, SeqCst);
+}</pre></td><td><pre>a:
+    stlr wzr, [x0]
+    ret</pre></td></tr><tr><td><pre>pub fn a(x: &amp;AtomicI32) -&gt; i32 {
+    x.load(SeqCst)
+}</pre></td><td><pre>a:
+    ldar w0, [x0]
+    ret</pre></td></tr><tr><td><pre>pub fn a(x: &amp;AtomicI32) {
+    x.fetch_add(10, SeqCst);
+}</pre></td><td><pre>a:
+.L1:
+    ldaxr w8, [x0]
+    add w9, w8, #10
+    stlxr w10, w9, [x0]
+    cbnz w10, .L1
+    ret</pre></td></tr></tbody></table></figure><p>This means that on ARM64, sequentially consistent operations are exactly as cheap as acquire and release operations.
+Or, rather, that ARM64 <code>Acquire</code>, <code>Release</code>, and <code>AcqRel</code> operations are as expensive as <code>SeqCst</code>.
+Unlike x86-64, however, <code>Relaxed</code> operations are relatively cheap, as they don’t result in
+stronger ordering guarantees than necessary.</p><aside id="armv81-rel-acq"><h4><a href="#armv81-rel-acq">ARMv8.1 Atomic Release and Acquire Instructions</a></h4><p><a class="indexterm" id="index-ARMv81atomicinstructions-2"></a> <a class="indexterm" id="index-ARM64instructions-ARMv81atomicinstructions-2"></a>
+As discussed in <a href="#armv81">"ARMv8.1 Atomic Instructions"</a>, the ARMv8.1 version of ARM64 includes CISC style instructions for atomic operations such as <code>ldadd</code> (load and add) as an alternative to an <code>ldxr</code>/<code>stxr</code> loop.</p><p>Just like the load and store operations have special versions with acquire and release semantics, these instructions also have variants for stronger memory ordering. Because these instructions involve both a load and a store, they each have three additional variants: one for release (<code>-l</code>), one for acquire (<code>-a</code>), and one for combined release and acquire (<code>-al</code>) semantics.</p><p><a class="indexterm" id="index-ldaddlloadandaddreleaseinstructionARM"></a> <a class="indexterm" id="index-ldaddaloadandaddacquireinstructionARM"></a> <a class="indexterm" id="index-ldaddalloadandaddacquireandreleaseinstructionARM"></a>
+For example, for <code>ldadd</code>, there is also <code>ldaddl</code>, <code>ldadda</code>, and <code>ldaddal</code>.
+<a class="indexterm" id="index-caslcompareandswapreleaseinstructionARM"></a> <a class="indexterm" id="index-casacompareandswapacquireinstructionARM"></a> <a class="indexterm" id="index-casalcompareandswapacquireandreleaseinstructionARM"></a>
+Similarly, the <code>cas</code> instruction comes with the <code>casl</code>, <code>casa</code>, and <code>casal</code> variants.</p><p>Just like for the load and store instructions, the combined release and acquire (<code>-al</code>) variants also suffice for <code>SeqCst</code> operations.
+  </p></aside></section><section id="reordering-experiment"><h3><a href="#reordering-experiment">An Experiment</a></h3><p><a class="indexterm" id="index-weaklyorderedarchitecture-experimentusingrelaxedinsteadofreleaseandacquire"></a> <a class="indexterm" id="index-memoryordering-experimentusingrelaxedinsteadofreleaseandacquire"></a> <a class="indexterm" id="index-releaseandacquirememoryordering-experimentusingrelaxedinstead"></a> <a class="indexterm" id="index-spinlocks-experimentusingwrongmemoryordering"></a>
+An unfortunate consequence of the popularity of strongly ordered architectures is that certain classes of memory ordering bugs can easily stay undiscovered.
+Using <code>Relaxed</code> where <code>Acquire</code> or <code>Release</code> is necessary is incorrect,
+but could accidentally end up working just fine in practice on x86-64,
+assuming the compiler doesn’t reorder your atomic operations.</p><div class="note" role="note" aria-label="caution"><div class="icon" aria-hidden="true"><i class="caution"></i></div><div class="text"><p>Remember that it’s not only the processor that can cause things to happen out of order.
+The compiler is also allowed to reorder the instructions it produces, as long as it takes
+the memory ordering constraints into account.</p><p>In practice, compilers tend to be very conservative about optimizations involving atomic operations,
+but that might very well change in the future.</p></div></div><p>This means one can easily write incorrect concurrent code that (accidentally) works perfectly fine on x86-64,
+but might break down when compiled for and run on an ARM64 processor.</p><p>Let’s try to do exactly that.</p><p>We’ll create a spin lock–protected counter, but change all the memory orderings to <code>Relaxed</code>.
+Let’s not bother with creating a custom type or unsafe code. Instead, let’s just use an <code>AtomicBool</code> for the lock and an <code>AtomicUsize</code> for the counter.</p><p><a class="indexterm" id="index-compilerfence-2"></a> <a class="indexterm" id="index-fences-compilerfence-2"></a> <a class="indexterm" id="index-memoryordering-compilerfence-2"></a>
+To be sure the compiler won’t be the one to reorder our operations,
+we’ll use the <code>std::<wbr>sync::<wbr>atomic::<wbr>compiler_<wbr>fence()</code> function to inform the compiler
+of the operations that should have been <code>Acquire</code> or <code>Release</code>,
+without telling the processor.</p><p>We’ll make four threads repeatedly lock, increment the counter, and unlock—a million times each. Putting that all together, we end up with the following code:</p><pre>fn main() {
+    let locked = AtomicBool::new(false);
+    let counter = AtomicUsize::new(0);
+
+    thread::scope(|s| {
+        // Spawn four threads, that each iterate a million times.
+        for _ in 0..4 {
+            s.spawn(|| for _ in 0..1_000_000 {
+                // Acquire the lock, using the wrong memory ordering.
+                while locked.swap(true, Relaxed) {}
+                compiler_fence(Acquire);
+
+                // Non-atomically increment the counter, while holding the lock.
+                let old = counter.load(Relaxed);
+                let new = old + 1;
+                counter.store(new, Relaxed);
+
+                // Release the lock, using the wrong memory ordering.
+                compiler_fence(Release);
+                locked.store(false, Relaxed);
+            });
+        }
+    });
+
+    println!("{}", counter.into_inner());
+}</pre><p>If the lock works properly, we’d expect the final value of the counter to be exactly four million.
+Note how incrementing the counter happens in a non-atomic way, with a separate <code>load</code> and <code>store</code>
+rather than a single <code>fetch_<wbr>add</code>, to make sure that any problems with the spin lock
+could result in missed increments and thus a lower total value of the counter.</p><p>Running this program a few times on a computer with an x86-64 processor gives:</p><pre>4000000
+4000000
+4000000</pre><p>As expected, we get release and acquire semantics for "free," and our mistake does not cause any issues.</p><p>Trying this on an Android phone from 2021 and a Raspberry Pi 3 model B, which both use an ARM64 processor,
+results in the same output:</p><pre>4000000
+4000000
+4000000</pre><p>This suggests that not all ARM64 processors make use of all forms of their instruction reordering,
+although we can’t assume much based on this experiment.</p><p>When trying this out on an 2021 Apple iMac, which contains an ARM64-based Apple M1 processor, we get something different:</p><pre>3988255
+3982153
+3984205</pre><p>Our previously hidden mistake suddenly turned into an actual issue—an issue that is only visible on a weakly ordered system.
+The counter is only off by about 0.4%, showing how subtle such an issue can be.
+In a real-life scenario, an issue like this might stay undiscovered for a very long time.</p><div class="note" role="note" aria-label="tip"><div class="icon" aria-hidden="true"><i class="tip"></i></div><div class="text"><p>Don’t forget to enable optimization (with <code>cargo run --release</code> or <code>rustc -O</code>) when trying to replicate the results above.
+Without optimization, the same code often results in many more instructions,
+which can hide the subtle effects of instruction reordering.
+   </p></div></div></section><section id="memory-fences"><h3><a href="#memory-fences">Memory Fences</a></h3><p><a class="indexterm" id="index-fences-instructions"></a> <a class="indexterm" id="index-instructions-fences"></a>
+There is one type of memory ordering related instruction we haven’t seen yet: memory fences.
+A <em>memory fence</em> or <em>memory barrier</em> instruction is used to represent a <code>std::<wbr>sync::<wbr>atomic::<wbr>fence</code>,
+which we discussed in <a href="memory-ordering.html#fences">"Fences" in Chapter 3</a>.</p><p>As we’ve seen before, memory ordering on x86-64 and ARM64 is all about instruction reordering.
+A fence instruction prevents certain types of instructions from being reordered past it.</p><p>An acquire fence must prevent preceding load operations from getting reordered
+with any memory operations that follow.
+Similarly, a release fence must prevent subsequent store operations from getting
+reordered with any preceding memory operations.
+A sequentially consistent fence must prevent all memory operations that precede it from being reordered
+with memory operations after the fence.</p><p>On x86-64, the basic memory ordering semantics already satisfy the needs of acquire and release fences.
+This architecture doesn’t allow the types of reordering that these fences prevent, regardless.</p><p>Let’s dive right in and see what instructions the four different fences compile to on both x86-64 and ARM64:</p><figure class="table"><table class="with-headers"><thead><tr><th>Rust source</th><th>Compiled x86-64</th><th>Compiled ARM64</th></tr></thead><tbody><tr><td><pre>pub fn a() {
+    fence(Acquire);
+}</pre></td><td><pre>a:
+    ret</pre></td><td><pre>a:
+    dmb ishld
+    ret</pre></td></tr><tr><td><pre>pub fn a() {
+    fence(Release);
+}</pre></td><td><pre>a:
+    ret</pre></td><td><pre>a:
+    dmb ish
+    ret</pre></td></tr><tr><td><pre>pub fn a() {
+    fence(AcqRel);
+}</pre></td><td><pre>a:
+    ret</pre></td><td><pre>a:
+    dmb ish
+    ret</pre></td></tr><tr><td><pre>pub fn a() {
+    fence(SeqCst);
+}</pre></td><td><pre>a:
+    mfence
+    ret</pre></td><td><pre>a:
+    dmb ish
+    ret</pre></td></tr></tbody></table></figure><p><a class="indexterm" id="index-fences-onx86-64"></a>
+Unsurprisingly, release and acquire fences on x86-64 do not result in any instruction.
+We get release and acquire semantics "for free" on this architecture.
+<a class="indexterm" id="index-mfencememoryfenceinstructionx86"></a> <a class="indexterm" id="index-x86-64instructions-mfencememoryfence"></a>
+Only a <code>SeqCst</code> fence results in an <code>mfence</code> (memory fence) instruction.
+This instruction makes sure that all memory operations before it have been completed before continuing.</p><p><a class="indexterm" id="index-fences-onARM64"></a> <a class="indexterm" id="index-dmbdatamemorybarrierinstructionARM"></a> <a class="indexterm" id="index-ARM64instructions-dmbdatamemorybarrier"></a>
+On ARM64, the equivalent instruction is <code>dmb ish</code> (data memory barrier, inner shared domain).
+Unlike on x86-64, it is used for <code>Release</code> and <code>AcqRel</code> as well, since this architecture doesn’t implicitly
+provide acquire and release semantics.
+For <code>Acquire</code>, a slightly less impactful variant is used: <code>dmb ishld</code>.
+This variant only waits for load operations to complete, but freely allows
+preceding store operations to be reordered past it.</p><p>Similar to what we saw before with the atomic operations,
+we see that x86-64 gives us release and acquire fences "for free," while on ARM64, sequentially consistent fences come at the same cost as release fences.
+   </p></section></section><section id="summary"><h2><a href="#summary">Summary</a></h2><ul><li><p>On x86-64 and ARM64, relaxed load and store operations are identical to their non-atomic equivalents.</p></li><li><p>The common atomic fetch-and-modify and compare-and-exchange operations
+on x86-64 (and ARM64 since ARMv8.1) have their own instructions.</p></li><li><p>On x86-64, an atomic operation for which there is no equivalent instruction compiles down to
+a compare-and-exchange loop.</p></li><li><p>On ARM64, any atomic operation can be represented by a load-linked/store-conditional loop:
+a loop that automatically restarts if the attempted memory operation was disrupted.</p></li><li><p>Caches operate on cache lines, which are often 64 bytes in size.</p></li><li><p>Caches are kept consistent with a cache coherence protocol, such as write-through or MESI.</p></li><li><p>Padding, for example through <code>#[repr(align(64)]</code>, can be useful
+for improving performance by preventing <em>false sharing</em>.</p></li><li><p>A load operation can be significantly cheaper than a failed compare-and-exchange operation,
+in part because the latter often demands exclusive access to a cache line.</p></li><li><p>Instruction reordering is invisible within a single threaded program.</p></li><li><p>On most architectures, including x86-64 and ARM64,
+memory ordering is about preventing certain types of instruction reordering.</p></li><li><p>On x86-64, every memory operation has acquire and release semantics, making it
+exactly as cheap or expensive as a relaxed operation.
+Everything other than stores and fences also has sequentially consistent semantics
+at no extra cost.</p></li><li><p>On ARM64, acquire and release semantics are not as cheap as relaxed operations,
+but do include sequentially consistent semantics at no extra cost.</p></li></ul><p>A summary of the assembly instructions we’ve seen in this chapter can be found in <a href="#instructions-overview">Figure 7-1</a>.
+<a class="indexterm" id="index-ARM64instructions-overview"></a> <a class="indexterm" id="index-x86-64instructions-overview"></a> <a class="indexterm" id="index-ARMv81atomicinstructions-overview"></a> <a class="indexterm" id="index-instructions-overview"></a> <a class="indexterm" id="index-overviewofatomicinstructions"></a></p><figure id="instructions-overview"><div class="image"><img src="images/raal_0701.svg"></div><figcaption>Figure 7-1. An overview of the instructions that the various atomic operations compile down to on ARM64 and x86-64 for each memory ordering. <a class="desc" href="alt/7-1.html"><img src="desc.svg" alt="Image description" title="Image description"></a></figcaption></figure></section></article><nav class="next"><a href="os-primitives.html">Next: Chapter 8. Operating System Primitives</a></nav></div>
+<footer>
+<p><a href=".">Rust Atomics and Locks</a><br>&copy; 2023 ♥ Mara Bos</p>
+<p><a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/"><img alt="Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License" src="https://i.creativecommons.org/l/by-nc-nd/4.0/88x31.png"></a></p>
+<p class="report-issue"><a href="https://github.com/m-ou-se/rust-atomics-and-locks/issues/">Report an issue</a></p>
+</footer>
+</body>
+</html>

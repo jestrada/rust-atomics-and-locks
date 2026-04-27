@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust Atomics and Locks — Preface</title>
+<meta name="author" content="Mara Bos">
+<meta name="theme-color" content="#FF69B4">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="site">
+<nav class="index">
+<a href=".">Rust Atomics and Locks</a>
+</nav>
+<article id="preface"><h1><a href="">Preface</a></h1><p>Rust has played, and keeps playing, a significant role in making systems programming more accessible.
+However, low-level concurrency topics such as atomics and memory ordering
+are still often thought of as somewhat mystical subjects that are best left to a
+very small group of experts.</p><p>While working on Rust-based real-time control systems and the Rust standard library over the past few years,
+I found that many of the available resources on atomics and related topics only
+cover a small part of the information I was looking for.
+Many resources focus entirely on C and C++,
+which can make it hard to form the connection with
+Rust’s concept of (memory and thread) safety and type system.
+The resources that cover the details of the abstract theory, like C++'s memory model,
+often only vaguely explain how it relates to actual hardware, if at all.
+There are many resources that cover every detail of the actual hardware,
+such as processor instructions and cache coherency,
+but forming a holistic understanding often requires collecting bits and pieces
+of information from many different places.</p><p>This book is an attempt to put relevant information in one place, connecting it all together,
+providing everything you need to build your own correct, safe, and ergonomic concurrency primitives,
+while understanding enough about the underlying hardware and the role of the operating system
+to be able to make design decisions and basic optimization trade-offs.</p><section id="who-this-book-is-for"><h2><a href="#who-this-book-is-for">Who This Book Is For</a></h2><p>The primary audience for this book is Rust developers who want to learn more about low-level concurrency.
+Additionally, this book can also be suitable for those who are not very familiar with Rust yet,
+but would like to know what low-level concurrency looks like from a Rust perspective.</p><p>It is assumed you know the basics of Rust,
+have a recent Rust compiler installed, and know how to compile and run Rust code using <code>cargo</code>.
+Rust concepts that are important for concurrency are briefly explained when relevant,
+so no prior knowledge about Rust concurrency is necessary.</p></section><section id="overview-of-the-chapters"><h2><a href="#overview-of-the-chapters">Overview of the Chapters</a></h2><p>This book consists of ten chapters.
+Here’s what to expect from each chapter, and what to look forward to:</p><dl><dt><a href="basics.html">Chapter 1 — Basics of Rust Concurrency</a></dt><dd><p>This chapter introduces all the tools and concepts
+we need for basic concurrency in Rust,
+such as threads, mutexes, thread safety, shared and exclusive references,
+interior mutability, and so on, which are foundational to the rest of the book.</p><p>For experienced Rust programmers who are familiar with these concepts,
+this chapter can serve as a quick refresher.
+For those who know these concepts from other languages but aren’t very
+familiar with Rust yet, this chapter will quickly fill you in
+on any Rust-specific knowledge you might need for the rest of the book.</p></dd><dt><a href="atomics.html">Chapter 2 — Atomics</a></dt><dd><p>In the second chapter we’ll learn about Rust’s atomic types and all their operations.
+We start with simple load and store operations, and build our way up to more
+advanced <em>compare-and-exchange loops</em>, exploring each new concept with
+several real-world use cases as usable examples.</p><p>While <em>memory ordering</em> is relevant for every atomic operation,
+that topic is left for the next chapter.
+This chapter only covers situations where <em>relaxed</em> memory ordering suffices,
+which is the case more often than one might expect.</p></dd><dt><a href="memory-ordering.html">Chapter 3 — Memory Ordering</a></dt><dd><p>After learning about the various atomic operations and how to use them,
+the third chapter introduces the most complicated topic of the book: memory <span>ordering</span>.</p><p>We’ll explore how the memory model works,
+what <em>happens-before relationships</em> are and how to create them,
+what all the different memory orderings mean,
+and why <em>sequentially consistent ordering</em> might not be the answer to everything.</p></dd><dt><a href="building-spinlock.html">Chapter 4 — Building Our Own Spin Lock</a></dt><dd><p>After learning the theory, we put it to practice in the next three chapters
+by building our own versions of several common concurrency primitives.
+The first of these chapters is a short one, in which we implement a <em>spin lock</em>.</p><p>We’ll start with a very minimal version to put
+<em>release and acquire memory ordering</em> to practice,
+and then we’ll explore Rust’s concept of <em>safety</em> to turn it
+into an ergonomic and hard-to-misuse Rust data type.</p></dd><dt><a href="building-channels.html">Chapter 5 — Building Our Own Channels</a></dt><dd><p>In Chapter 5, we’ll implement from scratch a handful of variations of a <em>one-shot channel</em>,
+a primitive that can be used to send data from one thread to another.</p><p>Starting with a very minimal but entirely <code>unsafe</code> version,
+we’ll work our way through several ways to design a safe interface,
+while considering design decisions and their consequences.</p></dd><dt><a href="building-arc.html">Chapter 6 — Building Our Own "Arc"</a></dt><dd><p>For the sixth chapter, we’ll take on a more challenging memory ordering puzzle.
+We’re going to implement our own version of atomic reference counting from scratch.</p><p>After adding support for <em>weak pointers</em> and optimizing it for performance,
+our final version will be practically identical to Rust’s standard <code>std::<wbr>sync::<wbr>Arc</code> type.</p></dd><dt><a href="hardware.html">Chapter 7 — Understanding the Processor</a></dt><dd><p>The seventh chapter is a deep dive into all the low-level details.
+We’ll explore what happens at the processor level,
+what the <em>assembly instructions</em> behind the atomic operations look like
+on the two most popular processor architectures,
+what caching is and how it affects the performance of our code,
+and we’ll find out what remains of the memory model at the hardware level.</p></dd><dt><a href="os-primitives.html">Chapter 8 — Operating System Primitives</a></dt><dd><p>In Chapter 8 we acknowledge that there are things we can’t do
+without the help of the operating system’s <em>kernel</em> and learn
+what functionality is available on Linux, macOS, and Windows.</p><p>We’ll discuss the concurrency primitives that are available through <em>pthreads</em> on POSIX systems,
+find out what we can do with the Windows API,
+and learn what the Linux <em>futex syscall</em> does.</p></dd><dt><a href="building-locks.html">Chapter 9 — Building Our Own Locks</a></dt><dd><p>Using what we’ve learned in the previous chapters, in Chapter 9 we’re going
+to build several implementations of a <em>mutex</em>, <em>condition variable</em>, and
+<em>reader-writer lock</em> from scratch.</p><p>For each of these, we’ll start with a minimal but complete version,
+which we’ll then attempt to optimize in various ways.
+Using some simple benchmark tests, we’ll find out
+that our attempts at optimization don’t always increase performance,
+while we discuss various design trade-offs.</p></dd><dt><a href="inspiration.html">Chapter 10 — Ideas and Inspiration</a></dt><dd><p>The final chapter makes sure you don’t fall into a void
+after finishing the book, but are instead left with
+ideas and inspiration for things to build and explore with your
+new knowledge and skills, perhaps kicking off an
+exciting journey further into the depths of low-level concurrency.</p></dd></dl></section><section id="code-examples"><h2><a href="#code-examples">Code Examples</a></h2><p>All code in this book is written for and tested using Rust 1.66.0,
+which was released on December 15, 2022.
+Earlier versions do not include all features used in this book.
+Later versions, however, should work just fine.</p><p>For brevity, the code examples do not include <code>use</code> statements,
+except for the first time a new item from the standard library is introduced.
+As a convenience, the following prelude can be used to import everything
+necessary to compile any of the code examples in this book:</p><pre>#[allow(unused)]
+use std::{
+    cell::{Cell, RefCell, UnsafeCell},
+    collections::VecDeque,
+    marker::PhantomData,
+    mem::{ManuallyDrop, MaybeUninit},
+    ops::{Deref, DerefMut},
+    ptr::NonNull,
+    rc::Rc,
+    sync::{*, atomic::{*, Ordering::*}},
+    thread::{self, Thread},
+};</pre><p>Supplemental material, including complete versions of all code examples,
+is available at <a href="https://marabos.nl/atomics/">https://<wbr>marabos.nl/atomics/</a>.</p><p>You may use all example code offered with this book for any purpose.</p><p>Attribution is appreciated, but not required. An attribution usually includes the title, author, publisher, and ISBN. For example: “<em>Rust Atomics and Locks</em> by Mara Bos (O’Reilly). Copyright 2023 Mara Bos, 978-1-098-11944-7.”</p></section><section id="conventions-used-in-this-book"><h2><a href="#conventions-used-in-this-book">Conventions Used in This Book</a></h2><p>The following typographical conventions are used in this book:</p><dl><dt><em>Italic</em></dt><dd><p>Used for new terms, URLs, and emphasis.</p></dd><dt><code>Constant width</code></dt><dd><p>Used for program listings, as well as within paragraphs to
+refer to program elements such as variable or function names, data types,
+statements, and keywords.</p></dd></dl><div class="note" role="note" aria-label="tip"><div class="icon" aria-hidden="true"><i class="tip"></i></div><div class="text"><p>This element signifies a tip or suggestion.</p></div></div><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>This element signifies a general note.</p></div></div><div class="note" role="note" aria-label="caution"><div class="icon" aria-hidden="true"><i class="caution"></i></div><div class="text"><p>This element indicates a warning or caution.</p></div></div></section><section id="contact-information"><h2><a href="#contact-information">Contact Information</a></h2><p>O’Reilly has a web page for this book, where errata, examples, and any additional information are listed.
+It is available at <a href="https://oreil.ly/rust-atomics-and-locks">https://<wbr>oreil.ly/rust-atomics-and-locks</a>.</p><p>Email <a href="mailto:bookquestions@oreilly.com"><em>bookquestions@oreilly.com</em></a> to comment or ask technical questions about this book. If you wish to reuse content from this book, and you feel your reuse falls outside fair use or the permission given in this Preface, feel free to contact O’Reilly at <a href="mailto:permissions@oreilly.com"><em>permissions@oreilly.com</em></a>.</p><p>For news and information about O’Reilly, visit <a href="https://oreilly.com">https://<wbr>oreilly.com</a>.</p><p>Follow O’Reilly on Twitter: <a href="https://twitter.com/oreillymedia">https://<wbr>twitter.com/oreillymedia</a>.</p><p>Follow the author on Twitter: <a href="https://twitter.com/m_ou_se">https://<wbr>twitter.com/m_<wbr>ou_<wbr>se</a>.</p></section><section id="acknowledgments"><h2><a href="#acknowledgments">Acknowledgments</a></h2><p>I’d like to thank everyone who had a part in the creation this book.
+Many people provided support and useful input, which has been incredibly helpful.
+In particular, I’d like to thank Amanieu d’Antras, Aria Beingessner,
+Paul McKenney, Carol Nichols, and Miguel Raz Guzmán Macedo for their invaluable
+and thoughtful feedback on the early drafts.
+I’d also like to thank everyone at O’Reilly,
+and in particular my editors, Shira Evans and Zan McQuade,
+for their inexhaustible enthusiasm and support.</p></section></article><nav class="next"><a href="basics.html">Next: Chapter 1. Basics of Rust Concurrency</a></nav></div>
+<footer>
+<p><a href=".">Rust Atomics and Locks</a><br>&copy; 2023 ♥ Mara Bos</p>
+<p><a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/"><img alt="Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License" src="https://i.creativecommons.org/l/by-nc-nd/4.0/88x31.png"></a></p>
+<p class="report-issue"><a href="https://github.com/m-ou-se/rust-atomics-and-locks/issues/">Report an issue</a></p>
+</footer>
+</body>
+</html>

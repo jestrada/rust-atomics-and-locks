@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust Atomics and Locks — Chapter 5. Building Our Own Channels</title>
+<meta name="author" content="Mara Bos">
+<meta name="theme-color" content="#FF69B4">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="site">
+<nav class="index">
+<a href=".">Rust Atomics and Locks</a>
+</nav>
+<article id="building-channels"><h1><a href="">Chapter 5. Building Our Own Channels</a></h1><p><a class="indexterm" id="index-buildingourown-channels"></a> <a class="indexterm" id="index-channels-buildingourown"></a> <em>Channels</em> can be used to send data between threads,
+and they come in many variants.
+Some channels can only be used between exactly one sender and one receiver,
+while others can send from any number of threads,
+or even allow multiple receivers.
+Some channels are blocking, meaning that receiving (and sometimes sending) is a blocking operation,
+making your thread sleep until the operation can be completed.
+Some channels are optimized for throughput, while others are optimized for low latency.</p><p>The variations are endless, and there is no one-size-fits-all version that fits all use cases.</p><p>In this chapter, we’ll implement a few relatively simple channels
+to not only explore some more applications of atomics,
+but also to learn more about how our requirements and assumptions can be captured in Rust’s type system.</p><section id="a-simple-mutex-based-channel"><h2><a href="#a-simple-mutex-based-channel">A Simple Mutex-Based Channel</a></h2><p><a class="indexterm" id="index-mutexes-usingtobuildachannel"></a> <a class="indexterm" id="index-conditionvariables-usingtobuildachannel"></a>
+A basic channel implementation does not require any knowledge of atomics.
+<a class="indexterm" id="index-VecDeque"></a>
+We can take a <code>VecDeque</code>, which is basically a <code>Vec</code> that allows for efficient adding and removing of elements on both ends,
+and protect it with a <code>Mutex</code> to allow multiple threads to access it.
+We then use the <code>VecDeque</code> as a queue of data, often called <em>messages</em>, that’s been sent but not yet received.
+Any thread that wants to send a message can simply add it to the back of the queue,
+and any thread that wants to receive a message just has to remove one from the front of the queue.</p><p>There’s just one more thing to add, which is used to make the receive operation blocking:
+a <code>Condvar</code> (see <a href="basics.html#condvar">"Condition Variables" in Chapter 1</a>) to notify waiting receivers of a new messsage.</p><p>An implementation of this can be quite short and relatively straightforward, as <span>shown below</span>:</p><pre>pub struct Channel&lt;T&gt; {
+    queue: Mutex&lt;VecDeque&lt;T&gt;&gt;,
+    item_ready: Condvar,
+}
+
+impl&lt;T&gt; Channel&lt;T&gt; {
+    pub fn new() -&gt; Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            item_ready: Condvar::new(),
+        }
+    }
+
+    pub fn send(&amp;self, message: T) {
+        self.queue.lock().unwrap().push_back(message);
+        self.item_ready.notify_one();
+    }
+
+    pub fn receive(&amp;self) -&gt; T {
+        let mut b = self.queue.lock().unwrap();
+        loop {
+            if let Some(message) = b.pop_front() {
+                return message;
+            }
+            b = self.item_ready.wait(b).unwrap();
+        }
+    }
+}</pre><p>Note how we didn’t have to use any atomics or unsafe code and didn’t have to think about the <code>Send</code> or <code>Sync</code> traits.
+<a class="indexterm" id="index-Synctrait-2"></a> <a class="indexterm" id="index-Sendtrait-2"></a>
+The compiler understands the interface of <code>Mutex</code> and what guarantees that type provides,
+and will implicitly understand that if both <code>Mutex&lt;T&gt;</code> and <code>Condvar</code> can safely be shared between threads,
+so can our <code>Channel&lt;T&gt;</code>.</p><p>Our <code>send</code> function locks the mutex to push the new message to the back of the queue,
+and directly notifies one potentially waiting receiver after unlocking the queue, by using the condition variable.</p><p>The <code>receive</code> function also locks the mutex to pop the next message from the front of the queue,
+but will use the condition variable to wait if there’s no message <span>available yet</span>.</p><div class="note" role="note" aria-label="tip"><div class="icon" aria-hidden="true"><i class="tip"></i></div><div class="text"><p>Remember that the <code>Condvar::<wbr>wait</code> method will unlock the <code>Mutex</code> while waiting and relock it before returning.
+So, our <code>receive</code> function will not keep the mutex locked while waiting.</p></div></div><p>While this channel is very flexible in usage, as it allows any number of sending and receiving threads,
+its implementation can be far from optimal in many situations.
+Even if there are plenty of messages ready to be received, any send or receive operation will briefly block
+any other send or receive operation, since they all have to lock the same mutex.
+If <code>VecDeque::<wbr>push</code> has to grow the capacity of the <code>VecDeque</code>,
+all sending and receiving threads will have to wait for that one thread to finish the reallocation,
+which might be unacceptable in some situations.</p><p>Another property which might be undesirable is that this channel’s queue might grow without bounds.
+Nothing is stopping senders from continuously sending new messages at a higher rate
+than receivers are processing them.
+ </p></section><section id="an-unsafe-one-shot-channel"><h2><a href="#an-unsafe-one-shot-channel">An Unsafe One-Shot Channel</a></h2><p>The variety of use cases for channels is virtually endless.
+However, in the rest of this chapter,
+we’ll focus on a specific type of use case:
+sending exactly one message from one thread to another.
+A channel designed for such a use case is often called a <em>one-shot channel</em>.
+<a class="indexterm" id="index-one-shotchannels"></a> <a class="indexterm" id="index-channels-one-shot"></a></p><p>We could take our <code>Mutex&lt;VecDeque&gt;</code> based implementation from above and substitute the <code>VecDeque</code> for an <code>Option</code>,
+effectively reducing the capacity of the queue to exactly one message.
+It would avoid allocation, but would still have some of the same downsides of using a <code>Mutex</code>.
+We can avoid this by building our own one-shot channel from scratch using atomics.</p><p>First, let’s build a minimal implementation of a one-shot channel without putting much
+thought into its interface.
+Later in this chapter, we’ll explore ways to improve its interface,
+and how to team up with Rust’s type system to provide users of our channel a pleasant experience.</p><p>The tools we need to start with are basically the same as we used for our <code>SpinLock&lt;T&gt;</code> (from <a href="building-spinlock.html">Chapter 4</a>):
+an <code>UnsafeCell</code> for storage and an <code>AtomicBool</code> to indicate its state.
+In this case, we use the atomic boolean to indicate whether the message is ready for consumption.</p><p>Before a message is sent, the channel is "empty" and does not contain any message of type <code>T</code> yet.
+We could use an <code>Option&lt;T&gt;</code> inside the cell to allow for the absence of a <code>T</code>.
+However, that could waste valuable space in memory,
+since our atomic boolean already tells us whether there is a message or not.
+<a class="indexterm" id="index-MaybeUninit"></a> <a class="indexterm" id="index-uninitializedmemory"></a>
+Instead, we can use a <code>std::<wbr>mem::<wbr>MaybeUninit&lt;T&gt;</code>, which is essentially the bare bones unsafe version of <code>Option&lt;T&gt;</code>:
+it requires its user to manually keep track of whether it has been initialized or not,
+and almost its entire interface is unsafe, as it can’t perform its <span>own checks</span>.</p><p>Putting that all together, we start our first attempt with this struct definition:</p><pre>use std::mem::MaybeUninit;
+
+pub struct Channel&lt;T&gt; {
+    message: UnsafeCell&lt;MaybeUninit&lt;T&gt;&gt;,
+    ready: AtomicBool,
+}</pre><p>Just like for our <code>SpinLock&lt;T&gt;</code>,
+we need to tell the compiler that our channel is safe to share between threads,
+or at least as long as <code>T</code> is <code>Send</code>:
+<a class="indexterm" id="index-Synctrait-implementingforchannel"></a></p><pre>unsafe impl&lt;T&gt; Sync for Channel&lt;T&gt; where T: Send {}</pre><p>A new channel is empty, with <code>ready</code> set to <code>false</code>, and <code>message</code> left uninitialized:</p><pre>impl&lt;T&gt; Channel&lt;T&gt; {
+    pub const fn new() -&gt; Self {
+        Self {
+            message: UnsafeCell::new(MaybeUninit::uninit()),
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    …
+}</pre><p>To send a message, it first needs to be stored in the cell,
+after which we can release it to the receiver by setting the <code>ready</code> flag to <code>true</code>.
+Attempting to do this more than once would be dangerous,
+since after setting the <code>ready</code> flag, the receiver might read the message at any point,
+which could race with a second attempt to send a message.
+<a class="indexterm" id="index-channels-unsafeinterface"></a>
+For now, we make this the responsibility of the user by making the method <code>unsafe</code> and
+leaving a note for them:</p><pre>    /// Safety: Only call this once!
+    pub unsafe fn send(&amp;self, message: T) {
+        (*self.message.get()).write(message);
+        self.ready.store(true, Release);
+    }</pre><p><a class="indexterm" id="index-MaybeUninit-2"></a>
+In the snippet above, we use the <code>UnsafeCell::<wbr>get</code> method to obtain a pointer to the <code>MaybeUninit&lt;T&gt;</code>,
+and unsafely dereference that to call <code>MaybeUninit::<wbr>write</code> to initialize it.
+This could result in undefined behavior when misused, but we’ve punted that responsibility over to the caller.</p><p>For the memory ordering, we need to use release ordering, since the atomic store effectively releases
+the message to the receiver.
+This makes sure the initialization of the message will be finished from the perspective of the receiving thread if it loads <code>true</code> from <code>self.ready</code> with acquire ordering.</p><p>For receiving, we’ll not bother with providing a blocking interface for now.
+Instead, we’ll provide two methods: one to check whether a message is available, and another to receive it.
+We’ll leave it to the user of our channel to use something like thread parking (<a href="basics.html#parking">"Thread Parking" in Chapter 1</a>)
+if they want to block.</p><p>These are the last two methods to complete this version of our channel:</p><pre>    pub fn is_ready(&amp;self) -&gt; bool {
+        self.ready.load(Acquire)
+    }
+
+    /// Safety: Only call this once,
+    /// and only after is_ready() returns true!
+    pub unsafe fn receive(&amp;self) -&gt; T {
+        (*self.message.get()).assume_init_read()
+    }</pre><p><a class="indexterm" id="index-Copytrait"></a> <a class="indexterm" id="index-MaybeUninit-3"></a>
+While the <code>is_<wbr>ready</code> method can always be called safely,
+the <code>receive</code> method uses <code>MaybeUninit::<wbr>assume_<wbr>init_<wbr>read()</code>,
+which unsafely assumes it has already been initialized
+and that it isn’t being used to produce multiple copies of non-<code>Copy</code> objects.
+Just like for <code>send</code>, we simply make that our user’s problem by making the function itself <code>unsafe</code>.</p><p>The result is a technically usable channel, but one that is unwieldy and generally disappointing.
+If held right, it does exactly what it is supposed to do, but there are many subtle ways to misuse it.</p><p>Calling <code>send</code> more than once might result in a data race, since the second sender will be overwriting
+the data while the receiver might be trying to read the first message.
+Even if receiving was properly synchronized,
+calling <code>send</code> from multiple threads might result in two threads attempting to concurrently write
+to the cell, again resulting in a data race.
+Also, calling <code>receive</code> more than once results in two copies of the message,
+even if <code>T</code> does not implement <code>Copy</code> and thus cannot safely be copied.
+<a class="indexterm" id="index-Copytrait-2"></a></p><p>A more subtle issue is the lack of a <code>Drop</code> implementation for our channel.
+<a class="indexterm" id="index-Droptrait-4"></a> <a class="indexterm" id="index-leaking-bymistake"></a> <a class="indexterm" id="index-channels-dropping"></a>
+The <code>MaybeUninit</code> type does not track whether it has been initialized or not,
+and will therefore not automatically drop its contents when dropped.
+This means that if a message is sent but never received, the message will never be dropped.
+This is not unsound, but it’s still something to avoid.
+While leaking is universally considered safe in Rust, it’s generally only acceptable as a consequence of another leak.
+For example, leaking a <code>Vec</code> also leaks its contents, but regular usage of a <code>Vec</code> does not result in any leaks.</p><p>Since we made the user responsible for everything, it’s only a matter of time
+before this results in an unfortunate accident.</p></section><section id="safety-through-runtime-checks"><h2><a href="#safety-through-runtime-checks">Safety Through Runtime Checks</a></h2><p><a class="indexterm" id="index-safeinterface-2"></a> <a class="indexterm" id="index-channels-safeinterface"></a>
+To allow for a safer interface,
+we can add some checks to make misuse result in a panic with a clear message,
+which is much preferable to undefined behavior.</p><p>Let’s start with the issue of calling <code>receive</code> before a message is ready.
+This one is simple to handle, as all we have to do is make the <code>receive</code> method
+validate the <code>ready</code> flag before attempting to read a message:</p><pre>    /// Panics if no message is available yet.
+    ///
+    /// Tip: Use `is_ready` to check first.
+    ///
+    /// Safety: Only call this once!
+    pub unsafe fn receive(&amp;self) -&gt; T {
+        if !self.ready.load(Acquire) {
+            panic!("no message available!");
+        }
+        (*self.message.get()).assume_init_read()
+    }</pre><p>The function is still unsafe, as the user is still responsible for not calling this function more than once,
+but failing to check <code>is_<wbr>ready()</code> first no longer results in undefined behavior.</p><p>Since we now have an acquire-load of the <code>ready</code> flag inside the <code>receive</code> method
+providing the necessary synchronization, we can lower
+the memory ordering of the load in <code>is_<wbr>ready</code> to <code>Relaxed</code>,
+since that one is now only used for indicative purposes:</p><pre>    pub fn is_ready(&amp;self) -&gt; bool {
+        self.ready.load(Relaxed)
+    }</pre><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>Remember that the <em>total modification order</em> (see <a href="memory-ordering.html#relaxed">"Relaxed Ordering" in Chapter 3</a>) on <code>ready</code>
+guarantees that after <code>is_<wbr>ready</code> loads <code>true</code> from it, <code>receive</code> will also see <code>true</code>.
+<a class="indexterm" id="index-relaxedmemoryordering-totalmodificationorder-3"></a> <a class="indexterm" id="index-memoryordering-totalmodificationorder-3"></a> <a class="indexterm" id="index-totalmodificationorder-3"></a>
+There is no possibility of <code>is_<wbr>ready</code> returning <code>true</code> and <code>receive()</code> still panicking,
+regardless of the memory ordering used in <code>is_<wbr>ready</code>.</p></div></div><p>The next issue to address is what happens when calling <code>receive</code> more than once.
+We can easily make that result in a panic as well by setting the <code>ready</code> flag back to <code>false</code> in our <code>receive</code> method, like this:</p><pre>    /// Panics if no message is available yet,
+    /// or if the message was already consumed.
+    ///
+    /// Tip: Use `is_ready` to check first.
+    pub fn receive(&amp;self) -&gt; T {
+        if !self.ready.swap(false, Acquire) {
+            panic!("no message available!");
+        }
+        // Safety: We've just checked (and reset) the ready flag.
+        unsafe { (*self.message.get()).assume_init_read() }
+    }</pre><p>We’ve simply changed the <code>load</code> for a <code>swap</code> to <code>false</code>,
+and suddenly the <code>receive</code> method is fully safe to call in any condition.
+The function is no longer marked as <code>unsafe</code>.
+Instead of making the user responsible for everything,
+we now take responsibility for the unsafe code, resulting in less stress for our user.
+<a class="indexterm" id="index-safeinterface-3"></a> <a class="indexterm" id="index-stressreducing"></a></p><p>For <code>send</code>, things are slightly more complicated.
+To prevent multiple <code>send</code> calls from accessing the cell at the same time,
+we need to know whether another <code>send</code> call has already started.
+The <code>ready</code> flag only tells us whether another <code>send</code> call has already finished,
+so that won’t suffice.</p><p>Let’s add a second flag, named <code>in_<wbr>use</code>, to indicate whether the channel has been taken in use:</p><pre>pub struct Channel&lt;T&gt; {
+    message: UnsafeCell&lt;MaybeUninit&lt;T&gt;&gt;,
+    in_use: AtomicBool, // New!
+    ready: AtomicBool,
+}
+
+impl&lt;T&gt; Channel&lt;T&gt; {
+    pub const fn new() -&gt; Self {
+        Self {
+            message: UnsafeCell::new(MaybeUninit::uninit()),
+            in_use: AtomicBool::new(false), // New!
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    …
+}</pre><p>Now all we need to do is set <code>in_<wbr>use</code> to <code>true</code> in the <code>send</code> method before
+accessing the cell and panic if it was already set by another call:</p><pre>    /// Panics when trying to send more than one message.
+    pub fn send(&amp;self, message: T) {
+        if self.in_use.swap(true, Relaxed) {
+            panic!("can't send more than one message!");
+        }
+        unsafe { (*self.message.get()).write(message) };
+        self.ready.store(true, Release);
+    }</pre><p><a class="indexterm" id="index-relaxedmemoryordering-totalmodificationorder-4"></a> <a class="indexterm" id="index-memoryordering-totalmodificationorder-4"></a> <a class="indexterm" id="index-totalmodificationorder-4"></a>
+We can use relaxed memory ordering for the atomic swap operation,
+because the <em>total modification order</em> (see <a href="memory-ordering.html#relaxed">"Relaxed Ordering" in Chapter 3</a>) of <code>in_<wbr>use</code> guarantees
+that there will only be a single swap operation on <code>in_<wbr>use</code> that will return <code>false</code>,
+which is the only case in which <code>send</code> will attempt to access the cell.</p><p>We now have a fully safe interface, though there is still one problem left.
+The last remaining issue occurs when sending a message that’s never received: it will never be dropped.
+While this does not result in undefined behavior and is allowed in safe code,
+it’s definitely something to avoid.</p><p>Since we reset the <code>ready</code> flag in the <code>receive</code> method, fixing this is easy:
+the <code>ready</code> flag indicates whether there’s a not-yet-received message in the cell
+that needs to be dropped.</p><p><a class="indexterm" id="index-Droptrait-5"></a>
+In the <code>Drop</code> implementation of our <code>Channel</code>,
+we don’t need to use an atomic operation to check the atomic <code>ready</code> flag, because an object can only be dropped if it is fully owned by whichever thread is dropping it,
+with no outstanding borrows.
+<a class="indexterm" id="index-atomictypes-getmut"></a>
+This means we can use the <code>AtomicBool::<wbr>get_<wbr>mut</code> method, which takes an exclusive reference (<code>&amp;mut self</code>),
+proving that atomic access is unnecessary.
+<a class="indexterm" id="index-UnsafeCell-getmut"></a>
+The same holds for <code>UnsafeCell</code>, through <code>UnsafeCell::<wbr>get_<wbr>mut</code>.</p><p>Using that, here’s the final piece of our fully safe and non-leaking channel:</p><pre>impl&lt;T&gt; Drop for Channel&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        if *self.ready.get_mut() {
+            unsafe { self.message.get_mut().assume_init_drop() }
+        }
+    }
+}</pre><p>Let’s try it out!</p><p>Since our <code>Channel</code> doesn’t provide a blocking interface (yet),
+we’ll manually use thread parking to wait on a message.
+The receiving thread will <code>park()</code> itself as long as there’s no message ready,
+and the sending thread will <code>unpark()</code> the receiver once it has sent something.
+<a class="indexterm" id="index-threadparking-2"></a></p><p>Here’s a complete test program, sending the string literal <code>"hello world!"</code>
+through our <code>Channel</code> from a second thread back to the main thread:</p><pre>fn main() {
+    let channel = Channel::new();
+    let t = thread::current();
+    thread::scope(|s| {
+        s.spawn(|| {
+            channel.send("hello world!");
+            t.unpark();
+        });
+        while !channel.is_ready() {
+            thread::park();
+        }
+        assert_eq!(channel.receive(), "hello world!");
+    });
+}</pre><p>This program compiles, runs, and exits cleanly, showing that our <code>Channel</code> works as it should.</p><p>If we duplicate the <code>send</code> line, we can also see one of our safety checks in action, producing
+the following panic message when the program is run:</p><pre>thread '&lt;unnamed&gt;' panicked at src/main.rs:
+can't send more than one message!</pre><p>While a panicking program isn’t great, it’s far better for a program to
+reliably panic than to get anywhere near the potential horrors of undefined
+behavior.</p><aside id="single-atomic"><h3><a href="#single-atomic">Using a Single Atomic for the Channel State</a></h3><p>In case you can’t get enough of implementing channels, here’s a subtle variation that can save one byte of memory.</p><p>Instead of using two separate atomic booleans to represent the state of the channel,
+we instead use a single <code>AtomicU8</code> to represent all four states.
+<a class="indexterm" id="index-compare-and-exchangeoperationsatomic-usingforchannelstate"></a> <a class="indexterm" id="index-atomic-compare-and-exchangeoperations-usingforchannelstate"></a>
+Rather than atomically swapping booleans,
+we’ll have to use <code>compare_<wbr>exchange</code> to atomically check if the channel
+is in the expected state and change it to another state.</p><pre>const EMPTY: u8 = 0;
+const WRITING: u8 = 1;
+const READY: u8 = 2;
+const READING: u8 = 3;
+
+pub struct Channel&lt;T&gt; {
+    message: UnsafeCell&lt;MaybeUninit&lt;T&gt;&gt;,
+    state: AtomicU8,
+}
+
+unsafe impl&lt;T: Send&gt; Sync for Channel&lt;T&gt; {}
+
+impl&lt;T&gt; Channel&lt;T&gt; {
+    pub const fn new() -&gt; Self {
+        Self {
+            message: UnsafeCell::new(MaybeUninit::uninit()),
+            state: AtomicU8::new(EMPTY),
+        }
+    }
+
+    pub fn send(&amp;self, message: T) {
+        if self.state.compare_exchange(
+            EMPTY, WRITING, Relaxed, Relaxed
+        ).is_err() {
+            panic!("can't send more than one message!");
+        }
+        unsafe { (*self.message.get()).write(message) };
+        self.state.store(READY, Release);
+    }
+
+    pub fn is_ready(&amp;self) -&gt; bool {
+        self.state.load(Relaxed) == READY
+    }
+
+    pub fn receive(&amp;self) -&gt; T {
+        if self.state.compare_exchange(
+            READY, READING, Acquire, Relaxed
+        ).is_err() {
+            panic!("no message available!");
+        }
+        unsafe { (*self.message.get()).assume_init_read() }
+    }
+}
+
+impl&lt;T&gt; Drop for Channel&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        if *self.state.get_mut() == READY {
+            unsafe { self.message.get_mut().assume_init_drop() }
+        }
+    }
+}</pre></aside></section><section id="safety-through-types"><h2><a href="#safety-through-types">Safety Through Types</a></h2><p>While we’ve successfully protected users of our <code>Channel</code> from undefined behavior,
+they still risk a panic if they accidentally use it incorrectly.
+Ideally, the compiler would check correct usage and point out misuse before the program is even run.</p><p>Let’s take a look at the issue of calling <code>send</code> or <code>receive</code> more than once.</p><p><a class="indexterm" id="index-ownership-moving-2"></a> <a class="indexterm" id="index-consumingargumentsbyvalue"></a> <a class="indexterm" id="index-argumentsconsuming"></a>
+To prevent a function from being called more than once,
+we can let it take an argument <em>by value</em>, which—​for non-<code>Copy</code> types—​will consume the object.
+After an object is consumed, or moved, it’s gone from the caller, preventing it from being used another time.</p><p><a class="indexterm" id="index-channels-SenderandReceivertypes"></a>
+By representing the ability to call <code>send</code> or <code>receive</code> each as a separate (non-<code>Copy</code>) type,
+and consuming that object when performing the operation, we can make sure each can only happen once.</p><p>This brings us to the following interface design, where instead of a single <code>Channel</code> type,
+a channel is represented by a pair of a <code>Sender</code> and a <code>Receiver</code>,
+which each have a method that takes <code>self</code> by value:</p><pre>pub fn channel&lt;T&gt;() -&gt; (Sender&lt;T&gt;, Receiver&lt;T&gt;) { … }
+
+pub struct Sender&lt;T&gt; { … }
+pub struct Receiver&lt;T&gt; { … }
+
+impl&lt;T&gt; Sender&lt;T&gt; {
+    pub fn send(self, message: T) { … }
+}
+
+impl&lt;T&gt; Receiver&lt;T&gt; {
+    pub fn is_ready(&amp;self) -&gt; bool { … }
+    pub fn receive(self) -&gt; T { … }
+}</pre><p>The user can create a channel by calling <code>channel()</code>,
+which will give them one <code>Sender</code> and one <code>Receiver</code>.
+They can freely pass each of these objects around, move them to another thread, and so on.
+However, they cannot end up with multiple copies of either of them,
+guaranteeing that <code>send</code> and <code>receive</code> can each only be called once.</p><p>To implement this, we need to find a place for our <code>UnsafeCell</code> and <code>AtomicBool</code>.
+Previously, we just had a single struct with those fields, but now we have two separate structs,
+each of which could outlive the other.</p><p><a class="indexterm" id="index-channels-storinginArc"></a> <a class="indexterm" id="index-Arc-usingforchannelstate"></a>
+Since the sender and receiver will need to share the ownership of those variables,
+we’ll use an <code>Arc</code> (<a href="basics.html#arc">"Reference Counting" in Chapter 1</a>) to provide us with a reference-counted shared allocation,
+in which we store the shared <code>Channel</code> object.
+As shown below, the <code>Channel</code> type does not have to be public,
+as its existence is just an implementation detail irrelevant to the user.</p><pre>pub struct Sender&lt;T&gt; {
+    channel: Arc&lt;Channel&lt;T&gt;&gt;,
+}
+
+pub struct Receiver&lt;T&gt; {
+    channel: Arc&lt;Channel&lt;T&gt;&gt;,
+}
+
+struct Channel&lt;T&gt; { // no longer `pub`
+    message: UnsafeCell&lt;MaybeUninit&lt;T&gt;&gt;,
+    ready: AtomicBool,
+}
+
+unsafe impl&lt;T&gt; Sync for Channel&lt;T&gt; where T: Send {}</pre><p>Just like before, we implement <code>Sync</code> for <code>Channel&lt;T&gt;</code> on the condition that <code>T</code> is <code>Send</code>,
+to allow it to be used across threads.</p><p>Note how we no longer need the <code>in_<wbr>use</code> atomic boolean like we did in our previous channel implementation.
+It was only used by <code>send</code> to check that it hadn’t been called more than once,
+which is now statically guaranteed through the type system.</p><p><a class="indexterm" id="index-Clonetrait-3"></a>
+The <code>channel</code> function to create a channel and sender-receiver pair looks similar to
+the <code>Channel::<wbr>new</code> function we had previously, except it wraps the <code>Channel</code> in an <code>Arc</code>,
+and wraps that <code>Arc</code> and a clone of it in the <code>Sender</code> and <code>Receiver</code> types:</p><pre>pub fn channel&lt;T&gt;() -&gt; (Sender&lt;T&gt;, Receiver&lt;T&gt;) {
+    let a = Arc::new(Channel {
+        message: UnsafeCell::new(MaybeUninit::uninit()),
+        ready: AtomicBool::new(false),
+    });
+    (Sender { channel: a.clone() }, Receiver { channel: a })
+}</pre><p>The <code>send</code>, <code>is_<wbr>ready</code>, and <code>receive</code> methods are basically identical to the ones we implemented before,
+with a few differences:</p><ul><li><p>They are now moved to their respective type, such that only the (one single) sender can send,
+and only the (one single) receiver can receive.</p></li><li><p><code>send</code> and <code>receive</code> now take <code>self</code> by value rather than by reference, to make sure they can each only be called once.</p></li><li><p><code>send</code> can no longer panic, as its precondition (only being called once) is now statically guaranteed.</p></li></ul><p>So, they now look like this:</p><pre>impl&lt;T&gt; Sender&lt;T&gt; {
+    /// This never panics. :)
+    pub fn send(self, message: T) {
+        unsafe { (*self.channel.message.get()).write(message) };
+        self.channel.ready.store(true, Release);
+    }
+}
+
+impl&lt;T&gt; Receiver&lt;T&gt; {
+    pub fn is_ready(&amp;self) -&gt; bool {
+        self.channel.ready.load(Relaxed)
+    }
+
+    pub fn receive(self) -&gt; T {
+        if !self.channel.ready.swap(false, Acquire) {
+            panic!("no message available!");
+        }
+        unsafe { (*self.channel.message.get()).assume_init_read() }
+    }
+}</pre><p>The <code>receive</code> function can still panic, since the user might still call it before <code>is_<wbr>ready()</code> returns <code>true</code>.
+It also still uses <code>swap</code> to set the <code>ready</code> flag back to <code>false</code> (instead of just <code>load</code>),
+so that the <code>Drop</code> implementation of <code>Channel</code> knows whether there’s an unread message that needs to be dropped.</p><p>That <code>Drop</code> implementation is exactly the same as the one we implemented before:</p><pre>impl&lt;T&gt; Drop for Channel&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        if *self.ready.get_mut() {
+            unsafe { self.message.get_mut().assume_init_drop() }
+        }
+    }
+}</pre><p>The <code>Drop</code> implementation of <code>Arc&lt;Channel&lt;T&gt;&gt;</code> will decrement the reference counter of the allocation
+when either the <code>Sender&lt;T&gt;</code> or <code>Receiver&lt;T&gt;</code> is dropped.
+<a class="indexterm" id="index-Droptrait-6"></a>
+When dropping the second one, that counter reaches zero, and the <code>Channel&lt;T&gt;</code> itself is dropped.
+That will invoke our <code>Drop</code> implementation above, where we get to drop the message if one was sent but not received.</p><p>Let’s try it out:</p><pre>fn main() {
+    thread::scope(|s| {
+        let (sender, receiver) = channel();
+        let t = thread::current();
+        s.spawn(move || {
+            sender.send("hello world!");
+            t.unpark();
+        });
+        while !receiver.is_ready() {
+            thread::park();
+        }
+        assert_eq!(receiver.receive(), "hello world!");
+    });
+}</pre><p>It’s a bit inconvenient that we still have to manually use thread parking to wait on a message,
+but we’ll deal with that problem later.</p><p>Our goal, for now, was to make at least one form of misuse impossible at compile time.
+Unlike last time, attempting to send twice does not result in a program that panics,
+but instead does not result in a valid program at all.
+If we add another <code>send</code> call to the working program above, the compiler now catches the issue and patiently informs us of our mistake:</p><pre>error[E0382]: use of moved value: `sender`
+  --&gt; src/main.rs
+   |
+   |             sender.send("hello world!");
+   |                    --------------------
+   |                     `sender` moved due to this method call
+   |
+   |             sender.send("second message");
+   |             ^^^^^^ value used here after move
+   |
+note: this function takes ownership of the receiver `self`, which moves `sender`
+  --&gt; src/lib.rs
+   |
+   |     pub fn send(self, message: T) {
+   |                 ^^^^
+   = note: move occurs because `sender` has type `Sender&lt;&amp;str&gt;`,
+           which does not implement the `Copy` trait</pre><p>Depending on the situation, it can be extremely tricky to design an
+interface that catches mistakes at compile time.
+If the situation does lend itself to such an interface, it can result not only in more convenience for the user,
+but also in a reduced number of runtime checks for things that are now statically guaranteed.
+We no longer needed the <code>in_<wbr>use</code> flag, and removed the <code>swap</code> and check from the <code>send</code> method, for example.</p><p>Unfortunately, new problems may arise that could lead to more runtime overhead.
+In this case, the problem was the split ownership,
+for which we had to reach for an <code>Arc</code> and pay the cost of an allocation.</p><p>Having to make trade-offs between safety, convenience, flexibility,
+simplicity, and performance is unfortunate, but sometimes unavoidable.
+Rust generally strives to make it easy to excel at all of these,
+but sometimes makes you trade a bit of one to maximize another.</p></section><section id="borrowing-to-avoid-allocation"><h2><a href="#borrowing-to-avoid-allocation">Borrowing to Avoid Allocation</a></h2><p>The <code>Arc</code>-based channel implementation we just designed is very convenient to use—at the cost of some performance, since it has to allocate memory.
+If we want to optimize for efficiency,
+we can trade some convenience for performance by making the user responsible for the shared <code>Channel</code> object.
+Instead of taking care of the allocation and ownership of the <code>Channel</code> behind the scenes,
+we can force the user to create a <code>Channel</code> that can be <em>borrowed</em> by the <code>Sender</code> and <code>Receiver</code>.
+That way, they can choose to simply put that <code>Channel</code> in a local variable, avoiding the overhead of allocating memory.
+<a class="indexterm" id="index-channels-borrowing"></a> <a class="indexterm" id="index-channels-storinginArc-avoiding"></a></p><p>We will also have to trade in some simplicity, since we will now have to deal with borrowing and lifetimes.</p><p><a class="indexterm" id="index-channels-SenderandReceivertypes-2"></a>
+So, the three types will now look as follows, with <code>Channel</code> public again, and <code>Sender</code> and <code>Receiver</code> borrowing it
+for a certain lifetime.</p><pre>pub struct Channel&lt;T&gt; {
+    message: UnsafeCell&lt;MaybeUninit&lt;T&gt;&gt;,
+    ready: AtomicBool,
+}
+
+unsafe impl&lt;T&gt; Sync for Channel&lt;T&gt; where T: Send {}
+
+pub struct Sender&lt;'a, T&gt; {
+    channel: &amp;'a Channel&lt;T&gt;,
+}
+
+pub struct Receiver&lt;'a, T&gt; {
+    channel: &amp;'a Channel&lt;T&gt;,
+}</pre><p>Instead of a <code>channel()</code> function to create a <code>(Sender, Receiver)</code> pair,
+we move back to the <code>Channel::<wbr>new</code> we had earlier in this chapter,
+allowing the user to create such an object as a local variable.</p><p>In addition, we need a way for the user to create a <code>Sender</code> and <code>Receiver</code> object
+that will borrow the <code>Channel</code>.
+This will need to be an exclusive borrow (<code>&amp;mut Channel</code>),
+to make sure there can’t be multiple senders or receivers for the same channel.
+By providing both the <code>Sender</code> and the <code>Receiver</code> at the same time,
+we can <em>split</em> the exclusive borrow into two shared borrows,
+such that both the sender and receiver can reference the channel,
+while preventing anything else from touching the channel.
+<a class="indexterm" id="index-borrowing-splitting"></a> <a class="indexterm" id="index-splittingborrowing"></a></p><p>This leads us to the following implementation:</p><pre>impl&lt;T&gt; Channel&lt;T&gt; {
+    pub const fn new() -&gt; Self {
+        Self {
+            message: UnsafeCell::new(MaybeUninit::uninit()),
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    pub fn split&lt;'a&gt;(&amp;'a mut self) -&gt; (Sender&lt;'a, T&gt;, Receiver&lt;'a, T&gt;) {
+        *self = Self::new();
+        (Sender { channel: self }, Receiver { channel: self })
+    }
+}</pre><p>The <code>split</code> method, with its somewhat complicated signature, warrants a closer look.
+It exclusively borrows <code>self</code> through an exclusive reference,
+but it splits that into two shared references, wrapped in the <code>Sender</code> and <code>Receiver</code> types.
+The <code>'a</code> lifetime makes it clear that both of those objects borrow something with a limited lifetime;
+in this case, the <code>Channel</code> itself.
+Since the <code>Channel</code> is exclusively borrowed, the caller will not be able to borrow or move it
+as long as the <code>Sender</code> or <code>Receiver</code> object exists.</p><p>Once those objects both cease to exist, however, the mutable borrow expires and the compiler
+happily lets the <code>Channel</code> object be borrowed again by a second call to <code>split()</code>.
+While we can assume <code>split()</code> cannot be called again while the <code>Sender</code> and <code>Receiver</code> still exist,
+we cannot prevent a second call to <code>split()</code> after those objects are dropped or forgotten.
+We need to make sure we don’t accidentally create a new <code>Sender</code> or <code>Receiver</code> object
+for a channel that already has its <code>ready</code> flag set, since that would break the
+assumptions that prevent undefined behavior.</p><p>By overwriting <code>*self</code> with a new empty channel in <code>split()</code>, we make sure it’s in the expected state
+when creating the <code>Sender</code> and <code>Receiver</code> states.
+This also invokes the <code>Drop</code> implementation on the old <code>*self</code>, which will take care of dropping
+a message that was previously sent but not received.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p><a class="indexterm" id="index-lifetime-elision-2"></a>
+Since the lifetime in the signature of <code>split</code> comes from <code>self</code>, it can be elided.
+The signature of <code>split</code> in the snippet above is identical to this less verbose version:</p><pre>pub fn split(&amp;mut self) -&gt; (Sender&lt;T&gt;, Receiver&lt;T&gt;) { … }</pre><p>While this version doesn’t explicitly show that the returned objects borrow <code>self</code>,
+the compiler still checks correct usage of the lifetime exactly the same as
+it does with the more verbose version.</p></div></div><p>The remaining methods and <code>Drop</code> implementation are
+the same as in our <code>Arc</code>-based implementation,
+except for an additional <code>'_<wbr></code> lifetime argument to the <code>Sender</code> and <code>Receiver</code> types.
+(If you forget those, the compiler will helpfully suggest adding them.)</p><p>For completeness, here’s the remaining code:</p><pre>impl&lt;T&gt; Sender&lt;'_, T&gt; {
+    pub fn send(self, message: T) {
+        unsafe { (*self.channel.message.get()).write(message) };
+        self.channel.ready.store(true, Release);
+    }
+}
+
+impl&lt;T&gt; Receiver&lt;'_, T&gt; {
+    pub fn is_ready(&amp;self) -&gt; bool {
+        self.channel.ready.load(Relaxed)
+    }
+
+    pub fn receive(self) -&gt; T {
+        if !self.channel.ready.swap(false, Acquire) {
+            panic!("no message available!");
+        }
+        unsafe { (*self.channel.message.get()).assume_init_read() }
+    }
+}
+
+impl&lt;T&gt; Drop for Channel&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        if *self.ready.get_mut() {
+            unsafe { self.message.get_mut().assume_init_drop() }
+        }
+    }
+}</pre><p>Let’s test it!</p><pre>fn main() {
+    let mut channel = Channel::new();
+    thread::scope(|s| {
+        let (sender, receiver) = channel.split();
+        let t = thread::current();
+        s.spawn(move || {
+            sender.send("hello world!");
+            t.unpark();
+        });
+        while !receiver.is_ready() {
+            thread::park();
+        }
+        assert_eq!(receiver.receive(), "hello world!");
+    });
+}</pre><p>The reduction in convenience compared to the <code>Arc</code>-based version is quite minimal:
+we only needed one more line to manually create a <code>Channel</code> object.
+Note, however, how the channel has to be created before the scope,
+to prove to the compiler that its existence will outlast both the sender and receiver.</p><p>To see the compiler’s borrow checker in action, try adding a second call to <code>channel.split()</code>
+in various places.
+You’ll see that calling it a second time within the thread scope results in an error,
+while calling it after the scope is acceptable.
+Even calling <code>split()</code> before the scope is fine,
+as long as you stop using the returned <code>Sender</code> and <code>Receiver</code> before the scope starts.</p></section><section id="blocking"><h2><a href="#blocking">Blocking</a></h2><p><a class="indexterm" id="index-blocking-channel"></a> <a class="indexterm" id="index-channels-blocking"></a>
+Let’s finally deal with the last remaining major inconvenience of our <code>Channel</code>,
+the lack of a blocking interface.
+We’ve already used thread parking every time we tested a new variant of our channel.
+It shouldn’t be too hard to integrate that pattern into the channel itself.</p><p>To be able to unpark the receiver, the sender needs to know which thread to unpark.
+<a class="indexterm" id="index-threadparking-3"></a> <a class="indexterm" id="index-Threadobject"></a> <a class="indexterm" id="index-Threadobject-unpark-2"></a> <a class="indexterm" id="index-unparkThread"></a>
+The <code>std::<wbr>thread::<wbr>Thread</code> type represents a handle to a thread and is exactly what we need for calling <code>unpark()</code>.
+We’ll store the handle to the receiving thread inside the <code>Sender</code> object, as follows:</p><pre>use std::thread::Thread;
+
+pub struct Sender&lt;'a, T&gt; {
+    channel: &amp;'a Channel&lt;T&gt;,
+    receiving_thread: Thread, // New!
+}</pre><p>This handle would refer to the wrong thread, however, if the <code>Receiver</code> object is sent between threads.
+The <code>Sender</code> would be unaware of that and would still refer to the thread that originally held the <code>Receiver</code>.</p><p>We can handle that problem by making the <code>Receiver</code> a bit more restrictive,
+by not allowing it to be sent between threads anymore.
+<a class="indexterm" id="index-Sendtrait-3"></a> <a class="indexterm" id="index-threadsafety-keepingobjectsononethread"></a>
+As discussed in <a href="basics.html#thread-safety">"Thread Safety: Send and Sync" in Chapter 1</a>,
+we can use the special <code>PhantomData</code> marker type to add this restriction to our struct.
+<a class="indexterm" id="index-PhantomData-2"></a>
+A <code>PhantomData&lt;*const ()&gt;</code> does the job, since a raw pointer, such as <code>*const ()</code>, does not implement <code>Send</code>:</p><pre>pub struct Receiver&lt;'a, T&gt; {
+    channel: &amp;'a Channel&lt;T&gt;,
+    _no_send: PhantomData&lt;*const ()&gt;, // New!
+}</pre><p>Next, we’ll have to modify the <code>Channel::<wbr>split</code> method to fill in the new fields, like this:</p><pre>    pub fn split&lt;'a&gt;(&amp;'a mut self) -&gt; (Sender&lt;'a, T&gt;, Receiver&lt;'a, T&gt;) {
+        *self = Self::new();
+        (
+            Sender {
+                channel: self,
+                receiving_thread: thread::current(), // New!
+            },
+            Receiver {
+                channel: self,
+                _no_send: PhantomData, // New!
+            }
+        )
+    }</pre><p>We use the handle to the current thread for the <code>receiving_<wbr>thread</code> field,
+since the <code>Receiver</code> object we return will stay on the current thread.</p><p>The <code>send</code> method doesn’t change much, as shown below.
+We only have to call <code>unpark()</code> on the <code>receiving_<wbr>thread</code> to wake up the receiver in case it is waiting:</p><pre>impl&lt;T&gt; Sender&lt;'_, T&gt; {
+    pub fn send(self, message: T) {
+        unsafe { (*self.channel.message.get()).write(message) };
+        self.channel.ready.store(true, Release);
+        self.receiving_thread.unpark(); // New!
+    }
+}</pre><p>The <code>receive</code> function undergoes a slightly larger change.
+The new version won’t panic if there’s no message yet,
+but will instead patiently wait for a message using <code>thread::<wbr>park()</code> and try again,
+as many times as necessary.</p><pre>impl&lt;T&gt; Receiver&lt;'_, T&gt; {
+    pub fn receive(self) -&gt; T {
+        while !self.channel.ready.swap(false, Acquire) {
+            thread::park();
+        }
+        unsafe { (*self.channel.message.get()).assume_init_read() }
+    }
+}</pre><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>Remember that <code>thread::<wbr>park()</code> might return spuriously.
+(Or because something other than our <code>send</code> method called <code>unpark()</code>.)
+This means that we cannot assume that the <code>ready</code> flag has been set when <code>park()</code> returns.
+So, we need to use a loop to check the flag again after getting unparked.</p></div></div><p>The <code>Channel&lt;T&gt;</code> struct, its <code>Sync</code> implementation, its <code>new</code> function, and its <code>Drop</code> implementation remain unchanged.</p><p>Let’s try it out!</p><pre>fn main() {
+    let mut channel = Channel::new();
+    thread::scope(|s| {
+        let (sender, receiver) = channel.split();
+        s.spawn(move || {
+            sender.send("hello world!");
+        });
+        assert_eq!(receiver.receive(), "hello world!");
+    });
+}</pre><p>Clearly, this <code>Channel</code> is more convenient to use than the last one,
+at least in this simple test program.
+We’ve had to pay for this convenience by trading in some flexibility:
+only the thread that calls <code>split()</code> may call <code>receive()</code>.
+If you swap the <code>send</code> and <code>receive</code> lines, this program will no longer compile.
+Depending on the use case, that might be entirely fine, useful, or very inconvenient.</p><p>There are a number of ways to address that issue,
+many of which will cost us some additional complexity and affect performance.
+In general, the number of variations and trade-offs we can continue
+to explore are virtually endless.</p><p><a class="indexterm" id="index-handthingsgettingoutof"></a>
+We could easily spend an unhealthy number of hours implementing another twenty
+variants of a one-shot channel, each with slightly different properties,
+for every imaginable use case and more.
+While that might sound like lots of fun,
+we should probably avoid that rabbit hole and end this chapter before things get out of hand.
+ </p></section><section id="summary"><h2><a href="#summary">Summary</a></h2><ul><li><p>A <em>channel</em> is used to send <em>messages</em> between threads.</p></li><li><p>A simple and flexible, but potentially inefficient, channel is relatively
+easy to implement with just a <code>Mutex</code> and a <code>Condvar</code>.</p></li><li><p>A <em>one-shot channel</em> is a channel designed to send only one message.</p></li><li><p>The <code>MaybeUninit&lt;T&gt;</code> type can be used to represent a potentially not-yet-initialized <code>T</code>.
+Its interface is mostly unsafe, making its user responsible for tracking whether
+it has been initialized, not duplicating non-<code>Copy</code> data, and dropping its contents if necessary.</p></li><li><p>Not dropping objects (also called <em>leaking</em> or <em>forgetting</em>) is safe,
+but frowned upon when done without good reason.</p></li><li><p>Panicking is an important tool for creating a safe interface.</p></li><li><p>Taking a non-<code>Copy</code> object by value can be used to prevent something from being done more than once.</p></li><li><p>Exclusively borrowing and splitting borrows can be a powerful tool for forcing correctness.</p></li><li><p>We can make sure an object stays on the same thread by making sure its type does not implement <code>Send</code>,
+which can be achieved with the <code>PhantomData</code> <span>marker type</span>.</p></li><li><p>Every design and implementation decision involves a trade-off
+and can best be made with a specific use case in mind.</p></li><li><p>Designing something without a use case can be fun and educational,
+  but can turn out to be an endless task.
+ </p></li></ul></section></article><nav class="next"><a href="building-arc.html">Next: Chapter 6. Building Our Own "Arc"</a></nav></div>
+<footer>
+<p><a href=".">Rust Atomics and Locks</a><br>&copy; 2023 ♥ Mara Bos</p>
+<p><a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/"><img alt="Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License" src="https://i.creativecommons.org/l/by-nc-nd/4.0/88x31.png"></a></p>
+<p class="report-issue"><a href="https://github.com/m-ou-se/rust-atomics-and-locks/issues/">Report an issue</a></p>
+</footer>
+</body>
+</html>

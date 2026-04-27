@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust Atomics and Locks — Chapter 4. Building Our Own Spin Lock</title>
+<meta name="author" content="Mara Bos">
+<meta name="theme-color" content="#FF69B4">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="site">
+<nav class="index">
+<a href=".">Rust Atomics and Locks</a>
+</nav>
+<article id="building-spinlock"><h1><a href="">Chapter 4. Building Our Own Spin Lock</a></h1><p><a class="indexterm" id="index-buildingourown-spinlocks"></a> <a class="indexterm" id="index-spinlocks-buildingourown"></a>
+Locking a regular mutex (see <a href="basics.html#mutexes">"Locking: Mutexes and RwLocks" in Chapter 1</a>)
+will put your thread to sleep when the mutex is already locked.
+This avoids wasting resources while waiting for the lock to be released.
+If a lock is only ever held for very brief moments and the threads locking it can run in parallel on different processor cores,
+it might be better for the threads to repeatedly try to lock it without actually going <span>to sleep</span>.</p><p><a class="indexterm" id="index-mutexes-spinlocks"></a>
+A spin lock is a mutex that does exactly that.
+Attempting to lock an already locked mutex will result in <em>busy-looping</em> or <em>spinning</em>:
+repeatedly trying over and over again until it finally succeeds.
+This can waste processor cycles, but can sometimes result in lower latency when locking.
+<a class="indexterm" id="index-spinning"></a> <a class="indexterm" id="index-busy-looping"></a></p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p><a class="indexterm" id="index-mutexes-spinning"></a>
+Many real-world implementations of mutexes, including <code>std::<wbr>sync::<wbr>Mutex</code>
+on some platforms, briefly behave like a spin lock before asking the operating system to put a thread to sleep.
+This is an attempt to combine the best of both worlds,
+although it depends entirely on the specific use case whether this behavior is beneficial or not.</p></div></div><p>In this chapter, we’ll build our own <code>SpinLock</code> type,
+applying what we’ve learned in Chapters <a href="atomics.html">2</a> and <a href="memory-ordering.html">3</a>,
+and see how we can use Rust’s type system to provide a safe and useful interface to the user of our <code>SpinLock</code>.</p><section id="a-minimal-implementation"><h2><a href="#a-minimal-implementation">A Minimal Implementation</a></h2><p>Let’s implement such a spin lock from scratch.</p><p>The most minimal version is pretty simple, as follows:</p><pre>pub struct SpinLock {
+    locked: AtomicBool,
+}</pre><p><a class="indexterm" id="index-AtomicBool-lockingusing-2"></a>
+All we need is a single boolean that indicates whether it is locked or not.
+We use an <em>atomic</em> boolean, since we want more than one thread to be able to interact with it simultaneously.</p><p>Then all we need is a constructor function, and the <code>lock</code> and <code>unlock</code> methods:</p><pre>impl SpinLock {
+    pub const fn new() -&gt; Self {
+        Self { locked: AtomicBool::new(false) }
+    }
+
+    pub fn lock(&amp;self) {
+        while self.locked.swap(true, Acquire) {
+            std::hint::spin_loop();
+        }
+    }
+
+    pub fn unlock(&amp;self) {
+        self.locked.store(false, Release);
+    }
+}</pre><p><a class="indexterm" id="index-swapoperationatomic-lockingusing"></a>
+The <code>locked</code> boolean starts at <code>false</code>,
+the <code>lock</code> swaps that for <code>true</code> and keeps trying if it was already <code>true</code>,
+and the <code>unlock</code> method just sets it back to <code>false</code>.</p><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>Instead of using a swap operation, we could also have used a compare-and-exchange operation to atomically
+check if the boolean is <code>false</code> and set it to <code>true</code> if that’s the case:</p><pre>    while self.locked.compare_exchange_weak(
+            false, true, Acquire, Relaxed).is_err()</pre><p>It’s a bit more verbose, but depending on your tastes this might be easier to follow,
+as it more clearly captures the concept of an operation that can fail or succeed.
+It might also result in slightly different instructions, however, as we’ll see in <a href="hardware.html">Chapter 7</a>.</p></div></div><p><a class="indexterm" id="index-spinloophint"></a> <a class="indexterm" id="index-hintspinloop"></a> <a class="indexterm" id="index-blocking-spinloop"></a>
+Within the <code>while</code> loop, we use a <em>spin loop hint</em>, which tells
+the processor that we’re spinning while waiting for something to change.
+On most major platforms, this hint results in a special instruction that causes the processor core
+to optimize its behavior for such a situation.
+For example, it might temporarily slow down or prioritize other useful things it can do.
+Unlike blocking operations such as <code>thread::<wbr>sleep</code> or <code>thread::<wbr>park</code>, however,
+a spin loop hint does not cause the operating system to be called
+to put your thread to sleep in favor of another thread.</p><div class="note" role="note" aria-label="tip"><div class="icon" aria-hidden="true"><i class="tip"></i></div><div class="text"><p>In general, it’s a good idea to include such a hint in a spin loop.
+Depending on the situation, it might even be good to execute this hint several times
+before attempting to access the atomic variable again.
+If you care about the last few nanoseconds of performance and want to find the optimal strategy,
+you’ll have to benchmark your specific use case.
+Unfortunately, the conclusions of such benchmarks can be highly dependent on the
+hardware, as we’ll see in <a href="hardware.html">Chapter 7</a>.</p></div></div><p><a class="indexterm" id="index-releaseandacquirememoryordering-lockingandunlocking-2"></a> <a class="indexterm" id="index-memoryordering-releaseandacquire-lockingandunlocking"></a> <a class="indexterm" id="index-spinlocks-memoryordering"></a> <a class="indexterm" id="index-happens-beforerelationships-lockingandunlocking-2"></a>
+We use acquire and release memory ordering to make sure that every <code>unlock()</code> call
+establishes a happens-before relationship with the <code>lock()</code> calls that follow.
+In other words, to make sure that after locking it, we can safely assume that
+whatever happened during the last time it was locked has already happened.
+This is the most classic use case of acquire and release ordering: acquiring and releasing a lock.</p><p><a href="#happens-before-diagram-spinlock">Figure 4-1</a> visualizes a situation where our <code>SpinLock</code> is used
+to protect access to some shared data, with two threads concurrently attempting to acquire the lock.
+Note how the unlock operation on the first thread forms a happens-before relationship with the
+lock operation on the second thread, which makes sure the threads cannot access the data concurrently.</p><figure id="happens-before-diagram-spinlock"><div class="image"><img srcset="images/raal_0401.png 2x"></div><figcaption>Figure 4-1. The happens-before relationships between two threads using our <code>SpinLock</code> to protect access to some shared data. <a class="desc" href="alt/4-1.html"><img src="desc.svg" alt="Image description" title="Image description"></a></figcaption></figure></section><section id="an-unsafe-spin-lock"><h2><a href="#an-unsafe-spin-lock">An Unsafe Spin Lock</a></h2><p>Our <code>SpinLock</code> type above has a fully safe interface since, by itself, it doesn’t cause any undefined behavior when misused.
+In most use cases, however, it will be used to protect mutations to a shared variable,
+which means the user will still have to use unsafe, unchecked code.</p><p>To provide an easier interface, we can change the <code>lock</code> method to give us an exclusive reference (<code>&amp;mut T</code>)
+to the data protected by the lock, since in most use cases, it’s the lock operation that guarantees that it’s safe to assume exclusive access.</p><p>To be able to do that, we have to change the type to be generic over the
+type of data it protects and add a field to hold that data.
+<a class="indexterm" id="index-interiormutability-2"></a> <a class="indexterm" id="index-UnsafeCell-2"></a>
+Since this data can be mutated (or accessed exclusively) even though the spin lock itself is shared,
+we need to use interior mutability (see <a href="basics.html#interior-mutability">"Interior Mutability" in Chapter 1</a>), for which we’ll use an <code>UnsafeCell</code>:</p><pre>use std::cell::UnsafeCell;
+
+pub struct SpinLock&lt;T&gt; {
+    locked: AtomicBool,
+    value: UnsafeCell&lt;T&gt;,
+}</pre><p>As a precaution, <code>UnsafeCell</code> does not implement <code>Sync</code>, which means that our
+type is now no longer shareable between threads, making it rather useless.
+To fix that, we need to promise to the compiler that it is actually safe for our type
+to be shared between threads.
+However, since the lock can be used to send values of type <code>T</code> from one thread to another,
+we must limit this promise to types that are safe to send between threads.
+So, we (unsafely) implement <code>Sync</code> for <code>SpinLock&lt;T&gt;</code> for all <code>T</code> that implement <code>Send</code>, like this:
+<a class="indexterm" id="index-Synctrait-implementingforspinlock"></a></p><pre>unsafe impl&lt;T&gt; Sync for SpinLock&lt;T&gt; where T: Send {}</pre><p>Note that we don’t need to require that <code>T</code> is <code>Sync</code>, because our <code>SpinLock&lt;T&gt;</code> will only
+allow one thread at a time to access the <code>T</code> it protects.
+Only if we were to give multiple threads access at once, like a reader-writer lock does for readers,
+would we (additionally) need to require <code>T: Sync</code>.</p><p>Next, our <code>new</code> function now needs to take a value of type <code>T</code> to initialize that <code>UnsafeCell</code> with:</p><pre>impl&lt;T&gt; SpinLock&lt;T&gt; {
+    pub const fn new(value: T) -&gt; Self {
+        Self {
+            locked: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    …
+}</pre><p>And then we get to the interesting part: <code>lock</code> and <code>unlock</code>.
+The reason we are doing all this, is to be able to return a <code>&amp;mut T</code> from <code>lock()</code>,
+such that the user isn’t required to write unsafe, unchecked code when using
+our lock to protect their data.
+This means that we now have to use unsafe code on our side, within the implementation of <code>lock</code>.
+An <code>UnsafeCell</code> can give us a raw pointer to its contents (<code>*mut T</code>) through its <code>get()</code> method,
+which we can convert to a reference within an <code>unsafe</code> block, as follows:</p><pre>    pub fn lock(&amp;self) -&gt; &amp;mut T {
+        while self.locked.swap(true, Acquire) {
+            std::hint::spin_loop();
+        }
+        unsafe { &amp;mut *self.value.get() }
+    }</pre><p><a class="indexterm" id="index-lifetime-elision"></a>
+Since the function signature of <code>lock</code> contains a reference both in its input and output,
+the lifetimes of the <code>&amp;self</code> and <code>&amp;mut T</code> have been elided and assumed to be identical.
+(See "Lifetime Elision" in "Chapter 10: Generic Types, Traits, and Lifetimes" of the Rust Book.)
+We can make the lifetimes explicit by writing them out manually, <span>like this</span>:</p><pre>    pub fn lock&lt;'a&gt;(&amp;'a self) -&gt; &amp;'a mut T { … }</pre><p>This clearly shows that the lifetime of the returned reference is the same as that of <code>&amp;self</code>.
+This means that we have claimed that the returned reference is valid as long as the lock itself exists.</p><p>If we pretend <code>unlock()</code> doesn’t exist, this would be a perfectly safe and sound interface.
+A <code>SpinLock</code> can be locked, resulting in a <code>&amp;mut T</code>, and can then never be locked again,
+which guarantees this exclusive reference is indeed exclusive.</p><p>If we try to add the <code>unlock()</code> method back, however, we would need a way to limit the lifetime of the returned
+reference until the next call to <code>unlock()</code>.
+If the compiler understood English, perhaps this would work:
+<a class="indexterm" id="index-lifetime-specifyingusingplainEnglish"></a></p><pre>    pub fn lock&lt;'a&gt;(&amp;self) -&gt; &amp;'a mut T
+    where
+        'a ends at the next call to unlock() on self,
+        even if that's done by another thread.
+        Oh, and it also ends when self is dropped, of course.
+        (Thanks!)
+    { … }</pre><p>Unfortunately, that’s not valid Rust.
+Instead of trying to explain this limitation to the compiler,
+we’ll have to explain it to the user.
+To shift the responsibility to the user,
+we mark the <code>unlock</code> function as <code>unsafe</code>,
+and leave a note for them explaining what they need to do to keep things sound:</p><pre>    /// Safety: The &amp;mut T from lock() must be gone!
+    /// (And no cheating by keeping reference to fields of that T around!)
+    pub unsafe fn unlock(&amp;self) {
+        self.locked.store(false, Release);
+    }</pre></section><section id="building-safe-spinlock"><h2><a href="#building-safe-spinlock">A Safe Interface Using a Lock Guard</a></h2><p><a class="indexterm" id="index-safeinterface"></a>
+To be able to provide a fully safe interface,
+we need to tie the unlocking operation to the end of the <code>&amp;mut T</code>.
+We can do that by wrapping this reference in our own type that behaves like a reference,
+but also implements the <code>Drop</code> trait to do something when it is dropped.</p><p>Such a type is often called a <em>guard</em>, as it effectively guards the state of the lock,
+and stays responsible for that state until it is dropped.
+<a class="indexterm" id="index-guards-spinlockguard"></a> <a class="indexterm" id="index-spinlocks-guard"></a></p><p>Our <code>Guard</code> type will simply contain a reference to the <code>SpinLock</code>, so that it can
+both access its <code>UnsafeCell</code> and reset the <code>AtomicBool</code> later:</p><pre>pub struct Guard&lt;T&gt; {
+    lock: &amp;SpinLock&lt;T&gt;,
+}</pre><p><a class="indexterm" id="index-lifetime-inastruct"></a>
+If we try to compile this, however, the compiler tells us:</p><pre>error[E0106]: missing lifetime specifier
+   --&gt; src/lib.rs
+    |
+    |         lock: &amp;SpinLock&lt;T&gt;,
+    |               ^ expected named lifetime parameter
+    |
+help: consider introducing a named lifetime parameter
+    |
+    ~     pub struct Guard&lt;'a, T&gt; {
+    |                      ^^^
+    ~         lock: &amp;'a SpinLock&lt;T&gt;,
+    |                ^^
+    |</pre><p>Apparently, this is not a place where lifetimes can be elided.
+We have to make explicit that the reference has a limited lifetime,
+exactly as the compiler suggests:</p><pre>pub struct Guard&lt;'a, T&gt; {
+    lock: &amp;'a SpinLock&lt;T&gt;,
+}</pre><p>This guarantees the <code>Guard</code> cannot outlive the <code>SpinLock</code>.</p><p>Next, we change the <code>lock</code> method on our <code>SpinLock</code> to return a <code>Guard</code>:</p><pre>    pub fn lock(&amp;self) -&gt; Guard&lt;T&gt; {
+        while self.locked.swap(true, Acquire) {
+            std::hint::spin_loop();
+        }
+        Guard { lock: self }
+    }</pre><p>Our <code>Guard</code> type has no constructor and its field is private,
+so this is the only way the user can obtain a <code>Guard</code>.
+Therefore, we can safely assume that the existence of a <code>Guard</code> means that
+the <code>SpinLock</code> has been locked.</p><p>To make <code>Guard&lt;T&gt;</code> behave like an (exclusive) reference,
+transparently giving access to the <code>T</code>,
+we have to implement the special <code>Deref</code> and <code>DerefMut</code> traits as follows:
+<a class="indexterm" id="index-Dereftrait-2"></a> <a class="indexterm" id="index-DerefMuttrait-3"></a></p><pre>use std::ops::{Deref, DerefMut};
+
+impl&lt;T&gt; Deref for Guard&lt;'_, T&gt; {
+    type Target = T;
+    fn deref(&amp;self) -&gt; &amp;T {
+        // Safety: The very existence of this Guard
+        // guarantees we've exclusively locked the lock.
+        unsafe { &amp;*self.lock.value.get() }
+    }
+}
+
+impl&lt;T&gt; DerefMut for Guard&lt;'_, T&gt; {
+    fn deref_mut(&amp;mut self) -&gt; &amp;mut T {
+        // Safety: The very existence of this Guard
+        // guarantees we've exclusively locked the lock.
+        unsafe { &amp;mut *self.lock.value.get() }
+    }
+}</pre><p>If we don’t manually implement <code>Send</code> and <code>Sync</code> for our <code>Guard</code> type, the compiler will do so automatically based on its fields.
+Since its only field is a <code>&amp;SpinLock&lt;T&gt;</code>, the compiler will conclude that a <code>Guard&lt;T&gt;</code> can safely be shared between threads if a <code>SpinLock&lt;T&gt;</code> can.
+However, because of our (unsafe) <code>Deref</code> implementation above,
+our <code>Guard&lt;T&gt;</code> actually behaves like an (exclusive) reference to the value (<code>T</code>), not to the lock (<code>SpinLock&lt;T&gt;</code>).</p><p>So, we need to make sure our <code>Guard</code> is only <code>Sync</code> if <code>T</code> is <code>Sync</code> (and <code>Send</code> if <code>T</code> is <code>Send</code>).
+Otherwise, we would accidentally allow multiple threads to share a single <code>Guard&lt;T&gt;</code> and concurrently access the same <code>T</code>, even when <code>T</code> is not <code>Sync</code>.</p><p>There are several ways to do this. The easiest is to add our own implementation of <code>Send</code> and <code>Sync</code> with the right bounds, as follows:
+<a class="indexterm" id="index-Sendtrait-implementingforspinlockguard"></a> <a class="indexterm" id="index-Synctrait-implementingforspinlockguard"></a></p><pre>unsafe impl&lt;T&gt; Send for Guard&lt;'_, T&gt; where T: Send {}
+unsafe impl&lt;T&gt; Sync for Guard&lt;'_, T&gt; where T: Sync {}</pre><div class="note" role="note" aria-label="note"><div class="icon" aria-hidden="true"><i class="note"></i></div><div class="text"><p>Note that the the <code>Send</code> implementation is technically unnecessary, since a <code>&amp;SpinLock&lt;T&gt;</code> is also <code>Send</code> only if <code>T</code> is <code>Send</code>.</p><p>An alternative to adding these manual trait implementations is to add a <code>PhantomData&lt;&amp;mut T&gt;</code> field to <code>Guard</code>,
+to inform the compiler it behaves like it has an exclusive reference to a <code>T</code>.</p><p>Another possibility is to replace the <code>&amp;SpinLock&lt;T&gt;</code> field of the <code>Guard</code> by separate <code>&amp;AtomicBool</code> and <code>&amp;mut T</code> fields, to refer to the <code>locked</code> and <code>value</code> fields of the <code>SpinLock</code> separately.
+That way, the compiler can see the <code>&amp;mut T</code> and will correctly implement <code>Send</code> and <code>Sync</code> for <code>Guard</code> based on that.</p></div></div><p><a class="indexterm" id="index-Droptrait-2"></a>
+As the final step, we implement <code>Drop</code> for <code>Guard</code>,
+allowing us to completely remove the unsafe <code>unlock</code> method:</p><pre>impl&lt;T&gt; Drop for Guard&lt;'_, T&gt; {
+    fn drop(&amp;mut self) {
+        self.lock.locked.store(false, Release);
+    }
+}</pre><p>And just like that, through the magic of <code>Drop</code> and Rust’s type system,
+we gave our <code>SpinLock</code> type a fully safe (and useful) interface.</p><p>Let’s try it out:</p><pre>fn main() {
+    let x = SpinLock::new(Vec::new());
+    thread::scope(|s| {
+        s.spawn(|| x.lock().push(1));
+        s.spawn(|| {
+            let mut g = x.lock();
+            g.push(2);
+            g.push(2);
+        });
+    });
+    let g = x.lock();
+    assert!(g.as_slice() == [1, 2, 2] || g.as_slice() == [2, 2, 1]);
+}</pre><p>The program above demonstrates how easy our <code>SpinLock</code> is to use.
+Thanks to <code>Deref</code> and <code>DerefMut</code>, we can directly call the <code>Vec::<wbr>push</code> method on the guard.
+And thanks to <code>Drop</code>, we don’t need to worry about unlocking.</p><p><a class="indexterm" id="index-Droptrait-3"></a> <a class="indexterm" id="index-dropfunction-2"></a>
+Explicitly unlocking is also possible, by calling <code>drop(g)</code> to drop the guard.
+If you try to unlock too early, you’ll see the guard doing its job through a compiler error.
+For example, if you insert <code>drop(g);</code> between the two <code>push(2)</code> lines,
+the second <code>push</code> will not compile, since you’ve already dropped <code>g</code> at that point:</p><pre>error[E0382]: borrow of moved value: `g`
+   --&gt; src/lib.rs
+    |
+    |     drop(g);
+    |          - value moved here
+    |     g.push(2);
+    |     ^^^^^^^^^ value borrowed here after move</pre><p>Thanks to Rust’s type system, we can rest assured that mistakes like this
+are caught before we can even run our program.</p></section><section id="summary"><h2><a href="#summary">Summary</a></h2><ul><li><p>A <em>spin lock</em> is a mutex that busy-loops, or spins, while waiting.</p></li><li><p>Spinning can reduce latency, but can also be a waste of clockcycles and reduce performance.</p></li><li><p>A <em>spin loop hint</em>, <code>std::<wbr>hint::<wbr>spin_<wbr>loop()</code>, can be used to inform the processor of a spin loop,
+which might increase its efficiency.</p></li><li><p>A <code>SpinLock&lt;T&gt;</code> can be implemented with just an <code>AtomicBool</code> and an <code>UnsafeCell&lt;T&gt;</code>,
+the latter of which is necessary for <em>interior mutability</em> (see <a href="basics.html#interior-mutability">"Interior Mutability" in Chapter 1</a>).</p></li><li><p>A <em>happens-before relationship</em> between unlock and lock operations
+is necessary to prevent a <em>data race</em>, which would result in <em>undefined behavior</em>.</p></li><li><p><em>Acquire and release memory ordering</em> are a perfect fit for this use case.</p></li><li><p>When making unchecked assumptions necessary to avoid undefined behavior,
+the responsibility can be shifted to the caller by making the function <code>unsafe</code>.</p></li><li><p>The <code>Deref</code> and <code>DerefMut</code> traits can be used to make a type behave like a reference,
+transparently providing access to another object.</p></li><li><p>The <code>Drop</code> trait can be used to do something when an object is dropped,
+such as when it goes out of scope, or when it is passed to <code>drop()</code>.</p></li><li><p>A <em>lock guard</em> is a useful design pattern of a special type that’s used to represent
+  (safe) access to a locked lock.
+  Such a type usually behaves similarly to a reference, thanks to the <code>Deref</code> traits,
+  and implements automatic unlocking through the <code>Drop</code> trait.
+ </p></li></ul></section></article><nav class="next"><a href="building-channels.html">Next: Chapter 5. Building Our Own Channels</a></nav></div>
+<footer>
+<p><a href=".">Rust Atomics and Locks</a><br>&copy; 2023 ♥ Mara Bos</p>
+<p><a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/"><img alt="Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License" src="https://i.creativecommons.org/l/by-nc-nd/4.0/88x31.png"></a></p>
+<p class="report-issue"><a href="https://github.com/m-ou-se/rust-atomics-and-locks/issues/">Report an issue</a></p>
+</footer>
+</body>
+</html>
