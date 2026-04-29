@@ -15,6 +15,8 @@ Concurrency can be notoriously difficult to get right. This book provides a soli
 
 ## Read Online
 
+Published at: https://jestrada.github.io/rust-atomics-and-locks/
+
 Build and serve locally:
 
 ```bash
